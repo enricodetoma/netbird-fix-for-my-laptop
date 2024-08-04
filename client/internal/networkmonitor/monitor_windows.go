@@ -250,5 +250,5 @@ func compareIntf(a, b *net.Interface) int {
 }
 
 func isSoftInterface(name string) bool {
-	return strings.Contains(strings.ToLower(name), "isatap") || strings.Contains(strings.ToLower(name), "teredo")
+	return strings.Contains(strings.ToLower(name), "isatap") || strings.Contains(strings.ToLower(name), "teredo") || strings.Contains(strings.ToLower(name), "connessione alla rete locale (lan)* 1") || strings.Contains(strings.ToLower(name), "connessione alla rete locale (lan)* 2")
 }
