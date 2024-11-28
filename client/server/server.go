@@ -39,6 +39,8 @@ const (
 	defaultMaxRetryInterval = 60 * time.Minute
 	defaultMaxRetryTime     = 14 * 24 * time.Hour
 	defaultRetryMultiplier  = 1.7
+
+	errRestoreResidualState = "failed to restore residual state: %v"
 )
 
 // Server for service control.
@@ -94,6 +96,14 @@ func (s *Server) Start() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	state := internal.CtxGetState(s.rootCtx)
+
+	if err := handlePanicLog(); err != nil {
+		log.Warnf("failed to redirect stderr: %v", err)
+	}
+
+	if err := restoreResidualState(s.rootCtx); err != nil {
+		log.Warnf(errRestoreResidualState, err)
+	}
 
 	// if current state contains any error, return it
 	// in all other cases we can continue execution only if status is idle and up command was
@@ -291,6 +301,10 @@ func (s *Server) Login(callerCtx context.Context, msg *proto.LoginRequest) (*pro
 
 	s.actCancel = cancel
 	s.mutex.Unlock()
+
+	if err := restoreResidualState(ctx); err != nil {
+		log.Warnf(errRestoreResidualState, err)
+	}
 
 	state := internal.CtxGetState(ctx)
 	defer func() {
@@ -549,6 +563,10 @@ func (s *Server) Up(callerCtx context.Context, _ *proto.UpRequest) (*proto.UpRes
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
+	if err := restoreResidualState(callerCtx); err != nil {
+		log.Warnf(errRestoreResidualState, err)
+	}
+
 	state := internal.CtxGetState(s.rootCtx)
 
 	// if current state contains any error, return it
@@ -607,6 +625,8 @@ func (s *Server) Up(callerCtx context.Context, _ *proto.UpRequest) (*proto.UpRes
 func (s *Server) Down(ctx context.Context, _ *proto.DownRequest) (*proto.DownResponse, error) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
+	s.oauthAuthFlow = oauthAuthFlow{}
 
 	if s.actCancel == nil {
 		return nil, fmt.Errorf("service is not up")
@@ -758,11 +778,11 @@ func toProtoFullStatus(fullStatus peer.FullStatus) *proto.FullStatus {
 			ConnStatus:                 peerState.ConnStatus.String(),
 			ConnStatusUpdate:           timestamppb.New(peerState.ConnStatusUpdate),
 			Relayed:                    peerState.Relayed,
-			Direct:                     peerState.Direct,
 			LocalIceCandidateType:      peerState.LocalIceCandidateType,
 			RemoteIceCandidateType:     peerState.RemoteIceCandidateType,
 			LocalIceCandidateEndpoint:  peerState.LocalIceCandidateEndpoint,
 			RemoteIceCandidateEndpoint: peerState.RemoteIceCandidateEndpoint,
+			RelayAddress:               peerState.RelayServerAddress,
 			Fqdn:                       peerState.FQDN,
 			LastWireguardHandshake:     timestamppb.New(peerState.LastWireguardHandshake),
 			BytesRx:                    peerState.BytesRx,
@@ -776,7 +796,7 @@ func toProtoFullStatus(fullStatus peer.FullStatus) *proto.FullStatus {
 
 	for _, relayState := range fullStatus.Relays {
 		pbRelayState := &proto.RelayState{
-			URI:       relayState.URI.String(),
+			URI:       relayState.URI,
 			Available: relayState.Err == nil,
 		}
 		if err := relayState.Err; err != nil {

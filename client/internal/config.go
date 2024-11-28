@@ -16,9 +16,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/netbirdio/netbird/client/iface"
 	"github.com/netbirdio/netbird/client/internal/routemanager/dynamic"
 	"github.com/netbirdio/netbird/client/ssh"
-	"github.com/netbirdio/netbird/iface"
 	mgm "github.com/netbirdio/netbird/management/client"
 	"github.com/netbirdio/netbird/util"
 )
@@ -117,6 +117,11 @@ type Config struct {
 // ReadConfig read config file and return with Config. If it is not exists create a new with default values
 func ReadConfig(configPath string) (*Config, error) {
 	if configFileIsExists(configPath) {
+		err := util.EnforcePermission(configPath)
+		if err != nil {
+			log.Errorf("failed to enforce permission on config dir: %v", err)
+		}
+
 		config := &Config{}
 		if _, err := util.ReadJson(configPath, config); err != nil {
 			return nil, err
@@ -159,12 +164,16 @@ func UpdateOrCreateConfig(input ConfigInput) (*Config, error) {
 		if err != nil {
 			return nil, err
 		}
-		err = WriteOutConfig(input.ConfigPath, cfg)
+		err = util.WriteJsonWithRestrictedPermission(context.Background(), input.ConfigPath, cfg)
 		return cfg, err
 	}
 
 	if isPreSharedKeyHidden(input.PreSharedKey) {
 		input.PreSharedKey = nil
+	}
+	err := util.EnforcePermission(input.ConfigPath)
+	if err != nil {
+		log.Errorf("failed to enforce permission on config dir: %v", err)
 	}
 	return update(input)
 }
@@ -176,7 +185,7 @@ func CreateInMemoryConfig(input ConfigInput) (*Config, error) {
 
 // WriteOutConfig write put the prepared config to the given path
 func WriteOutConfig(path string, config *Config) error {
-	return util.WriteJson(path, config)
+	return util.WriteJson(context.Background(), path, config)
 }
 
 // createNewConfig creates a new config generating a new Wireguard key and saving to file
@@ -206,7 +215,7 @@ func update(input ConfigInput) (*Config, error) {
 	}
 
 	if updated {
-		if err := util.WriteJson(input.ConfigPath, config); err != nil {
+		if err := util.WriteJson(context.Background(), input.ConfigPath, config); err != nil {
 			return nil, err
 		}
 	}

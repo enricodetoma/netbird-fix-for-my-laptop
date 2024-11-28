@@ -138,12 +138,12 @@ func (c *Client) Stop() {
 	c.ctxCancel()
 }
 
-// ÏSetTraceLogLevel configure the logger to trace level
+// SetTraceLogLevel configure the logger to trace level
 func (c *Client) SetTraceLogLevel() {
 	log.SetLevel(log.TraceLevel)
 }
 
-// getStatusDetails return with the list of the PeerInfos
+// GetStatusDetails return with the list of the PeerInfos
 func (c *Client) GetStatusDetails() *StatusDetails {
 
 	fullStatus := c.recorder.GetFullStatus()
@@ -168,7 +168,6 @@ func (c *Client) GetStatusDetails() *StatusDetails {
 			BytesTx:                    p.BytesTx,
 			ConnStatus:                 p.ConnStatus.String(),
 			ConnStatusUpdate:           p.ConnStatusUpdate.Format("2006-01-02 15:04:05"),
-			Direct:                     p.Direct,
 			LastWireguardHandshake:     p.LastWireguardHandshake.String(),
 			Relayed:                    p.Relayed,
 			RosenpassEnabled:           p.RosenpassEnabled,

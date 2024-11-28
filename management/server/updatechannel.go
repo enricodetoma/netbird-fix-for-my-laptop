@@ -14,14 +14,15 @@ import (
 const channelBufferSize = 100
 
 type UpdateMessage struct {
-	Update *proto.SyncResponse
+	Update     *proto.SyncResponse
+	NetworkMap *NetworkMap
 }
 
 type PeersUpdateManager struct {
 	// peerChannels is an update channel indexed by Peer.ID
 	peerChannels map[string]chan *UpdateMessage
 	// channelsMux keeps the mutex to access peerChannels
-	channelsMux *sync.Mutex
+	channelsMux *sync.RWMutex
 	// metrics provides method to collect application metrics
 	metrics telemetry.AppMetrics
 }
@@ -30,7 +31,7 @@ type PeersUpdateManager struct {
 func NewPeersUpdateManager(metrics telemetry.AppMetrics) *PeersUpdateManager {
 	return &PeersUpdateManager{
 		peerChannels: make(map[string]chan *UpdateMessage),
-		channelsMux:  &sync.Mutex{},
+		channelsMux:  &sync.RWMutex{},
 		metrics:      metrics,
 	}
 }
@@ -41,6 +42,7 @@ func (p *PeersUpdateManager) SendUpdate(ctx context.Context, peerID string, upda
 	var found, dropped bool
 
 	p.channelsMux.Lock()
+
 	defer func() {
 		p.channelsMux.Unlock()
 		if p.metrics != nil {
@@ -55,7 +57,7 @@ func (p *PeersUpdateManager) SendUpdate(ctx context.Context, peerID string, upda
 			log.WithContext(ctx).Debugf("update was sent to channel for peer %s", peerID)
 		default:
 			dropped = true
-			log.WithContext(ctx).Warnf("channel for peer %s is %d full", peerID, len(channel))
+			log.WithContext(ctx).Warnf("channel for peer %s is %d full or closed", peerID, len(channel))
 		}
 	} else {
 		log.WithContext(ctx).Debugf("peer %s has no channel", peerID)
@@ -94,9 +96,12 @@ func (p *PeersUpdateManager) closeChannel(ctx context.Context, peerID string) {
 	if channel, ok := p.peerChannels[peerID]; ok {
 		delete(p.peerChannels, peerID)
 		close(channel)
+
+		log.WithContext(ctx).Debugf("closed updates channel of a peer %s", peerID)
+		return
 	}
 
-	log.WithContext(ctx).Debugf("closed updates channel of a peer %s", peerID)
+	log.WithContext(ctx).Debugf("closing updates channel: peer %s has no channel", peerID)
 }
 
 // CloseChannels closes updates channel for each given peer

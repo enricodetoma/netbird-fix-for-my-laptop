@@ -5,7 +5,6 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"path/filepath"
 	"runtime"
 	sync2 "sync"
 	"time"
@@ -52,8 +51,6 @@ var _ = Describe("Management service", func() {
 		dataDir, err = os.MkdirTemp("", "wiretrustee_mgmt_test_tmp_*")
 		Expect(err).NotTo(HaveOccurred())
 
-		err = util.CopyFileContents("testdata/store.json", filepath.Join(dataDir, "store.json"))
-		Expect(err).NotTo(HaveOccurred())
 		var listener net.Listener
 
 		config := &server.Config{}
@@ -61,7 +58,7 @@ var _ = Describe("Management service", func() {
 		Expect(err).NotTo(HaveOccurred())
 		config.Datadir = dataDir
 
-		s, listener = startServer(config)
+		s, listener = startServer(config, dataDir, "testdata/store.sql")
 		addr = listener.Addr().String()
 		client, conn = createRawClient(addr)
 
@@ -456,8 +453,8 @@ func (a MocIntegratedValidator) ValidateExtraSettings(_ context.Context, newExtr
 	return nil
 }
 
-func (a MocIntegratedValidator) ValidatePeer(_ context.Context, update *nbpeer.Peer, peer *nbpeer.Peer, userID string, accountID string, dnsDomain string, peersGroup []string, extraSettings *account.ExtraSettings) (*nbpeer.Peer, error) {
-	return update, nil
+func (a MocIntegratedValidator) ValidatePeer(_ context.Context, update *nbpeer.Peer, peer *nbpeer.Peer, userID string, accountID string, dnsDomain string, peersGroup []string, extraSettings *account.ExtraSettings) (*nbpeer.Peer, bool, error) {
+	return update, false, nil
 }
 
 func (a MocIntegratedValidator) GetValidatedPeers(accountID string, groups map[string]*group.Group, peers map[string]*nbpeer.Peer, extraSettings *account.ExtraSettings) (map[string]struct{}, error) {
@@ -530,12 +527,12 @@ func createRawClient(addr string) (mgmtProto.ManagementServiceClient, *grpc.Clie
 	return mgmtProto.NewManagementServiceClient(conn), conn
 }
 
-func startServer(config *server.Config) (*grpc.Server, net.Listener) {
+func startServer(config *server.Config, dataDir string, testFile string) (*grpc.Server, net.Listener) {
 	lis, err := net.Listen("tcp", ":0")
 	Expect(err).NotTo(HaveOccurred())
 	s := grpc.NewServer()
 
-	store, _, err := server.NewTestStoreFromJson(context.Background(), config.Datadir)
+	store, _, err := server.NewTestStoreFromSQL(context.Background(), testFile, dataDir)
 	if err != nil {
 		log.Fatalf("failed creating a store: %s: %v", config.Datadir, err)
 	}
@@ -552,8 +549,9 @@ func startServer(config *server.Config) (*grpc.Server, net.Listener) {
 	if err != nil {
 		log.Fatalf("failed creating a manager: %v", err)
 	}
-	turnManager := server.NewTimeBasedAuthSecretsManager(peersUpdateManager, config.TURNConfig)
-	mgmtServer, err := server.NewServer(context.Background(), config, accountManager, peersUpdateManager, turnManager, nil, nil)
+
+	secretsManager := server.NewTimeBasedAuthSecretsManager(peersUpdateManager, config.TURNConfig, config.Relay)
+	mgmtServer, err := server.NewServer(context.Background(), config, accountManager, peersUpdateManager, secretsManager, nil, nil)
 	Expect(err).NotTo(HaveOccurred())
 	mgmtProto.RegisterManagementServiceServer(s, mgmtServer)
 	go func() {

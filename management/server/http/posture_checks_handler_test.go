@@ -14,7 +14,6 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/netbirdio/netbird/management/server"
 	"github.com/netbirdio/netbird/management/server/geolocation"
 	"github.com/netbirdio/netbird/management/server/http/api"
 	"github.com/netbirdio/netbird/management/server/jwtclaims"
@@ -41,15 +40,15 @@ func initPostureChecksTestData(postureChecks ...*posture.Checks) *PostureChecksH
 				}
 				return p, nil
 			},
-			SavePostureChecksFunc: func(_ context.Context, accountID, userID string, postureChecks *posture.Checks) error {
+			SavePostureChecksFunc: func(_ context.Context, accountID, userID string, postureChecks *posture.Checks) (*posture.Checks, error) {
 				postureChecks.ID = "postureCheck"
 				testPostureChecks[postureChecks.ID] = postureChecks
 
 				if err := postureChecks.Validate(); err != nil {
-					return status.Errorf(status.InvalidArgument, err.Error()) //nolint
+					return nil, status.Errorf(status.InvalidArgument, err.Error()) //nolint
 				}
 
-				return nil
+				return postureChecks, nil
 			},
 			DeletePostureChecksFunc: func(_ context.Context, accountID, postureChecksID, userID string) error {
 				_, ok := testPostureChecks[postureChecksID]
@@ -67,15 +66,8 @@ func initPostureChecksTestData(postureChecks ...*posture.Checks) *PostureChecksH
 				}
 				return accountPostureChecks, nil
 			},
-			GetAccountFromTokenFunc: func(_ context.Context, claims jwtclaims.AuthorizationClaims) (*server.Account, *server.User, error) {
-				user := server.NewAdminUser("test_user")
-				return &server.Account{
-					Id: claims.AccountId,
-					Users: map[string]*server.User{
-						"test_user": user,
-					},
-					PostureChecks: postureChecks,
-				}, user, nil
+			GetAccountIDFromTokenFunc: func(_ context.Context, claims jwtclaims.AuthorizationClaims) (string, string, error) {
+				return claims.AccountId, claims.UserId, nil
 			},
 		},
 		geolocationManager: &geolocation.Geolocation{},

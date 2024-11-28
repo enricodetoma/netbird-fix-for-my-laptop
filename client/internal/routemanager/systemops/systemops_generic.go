@@ -16,10 +16,11 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	nberrors "github.com/netbirdio/netbird/client/errors"
+	"github.com/netbirdio/netbird/client/iface"
 	"github.com/netbirdio/netbird/client/internal/routemanager/refcounter"
 	"github.com/netbirdio/netbird/client/internal/routemanager/util"
 	"github.com/netbirdio/netbird/client/internal/routemanager/vars"
-	"github.com/netbirdio/netbird/iface"
+	"github.com/netbirdio/netbird/client/internal/statemanager"
 	nbnet "github.com/netbirdio/netbird/util/net"
 )
 
@@ -30,7 +31,9 @@ var splitDefaultv6_2 = netip.PrefixFrom(netip.AddrFrom16([16]byte{0x80}), 1)
 
 var ErrRoutingIsSeparate = errors.New("routing is separate")
 
-func (r *SysOps) setupRefCounter(initAddresses []net.IP) (nbnet.AddHookFunc, nbnet.RemoveHookFunc, error) {
+func (r *SysOps) setupRefCounter(initAddresses []net.IP, stateManager *statemanager.Manager) (nbnet.AddHookFunc, nbnet.RemoveHookFunc, error) {
+	stateManager.RegisterState(&ShutdownState{})
+
 	initialNextHopV4, err := GetNextHop(netip.IPv4Unspecified())
 	if err != nil && !errors.Is(err, vars.ErrRouteNotFound) {
 		log.Errorf("Unable to get initial v4 default next hop: %v", err)
@@ -41,7 +44,7 @@ func (r *SysOps) setupRefCounter(initAddresses []net.IP) (nbnet.AddHookFunc, nbn
 	}
 
 	refCounter := refcounter.New(
-		func(prefix netip.Prefix, _ any) (Nexthop, error) {
+		func(prefix netip.Prefix, _ struct{}) (Nexthop, error) {
 			initialNexthop := initialNextHopV4
 			if prefix.Addr().Is6() {
 				initialNexthop = initialNextHopV6
@@ -53,6 +56,7 @@ func (r *SysOps) setupRefCounter(initAddresses []net.IP) (nbnet.AddHookFunc, nbn
 				// These errors are not critical, but also we should not track and try to remove the routes either.
 				return nexthop, refcounter.ErrIgnore
 			}
+
 			return nexthop, err
 		},
 		r.removeFromRouteTable,
@@ -60,10 +64,17 @@ func (r *SysOps) setupRefCounter(initAddresses []net.IP) (nbnet.AddHookFunc, nbn
 
 	r.refCounter = refCounter
 
-	return r.setupHooks(initAddresses)
+	return r.setupHooks(initAddresses, stateManager)
 }
 
-func (r *SysOps) cleanupRefCounter() error {
+// updateState updates state on every change so it will be persisted regularly
+func (r *SysOps) updateState(stateManager *statemanager.Manager) {
+	if err := stateManager.UpdateState((*ShutdownState)(r.refCounter)); err != nil {
+		log.Errorf("failed to update state: %v", err)
+	}
+}
+
+func (r *SysOps) cleanupRefCounter(stateManager *statemanager.Manager) error {
 	if r.refCounter == nil {
 		return nil
 	}
@@ -74,6 +85,10 @@ func (r *SysOps) cleanupRefCounter() error {
 
 	if err := r.refCounter.Flush(); err != nil {
 		return fmt.Errorf("flush route manager: %w", err)
+	}
+
+	if err := stateManager.DeleteState(&ShutdownState{}); err != nil {
+		return fmt.Errorf("delete state: %w", err)
 	}
 
 	return nil
@@ -310,16 +325,18 @@ func (r *SysOps) genericRemoveVPNRoute(prefix netip.Prefix, intf *net.Interface)
 	return r.removeFromRouteTable(prefix, nextHop)
 }
 
-func (r *SysOps) setupHooks(initAddresses []net.IP) (nbnet.AddHookFunc, nbnet.RemoveHookFunc, error) {
+func (r *SysOps) setupHooks(initAddresses []net.IP, stateManager *statemanager.Manager) (nbnet.AddHookFunc, nbnet.RemoveHookFunc, error) {
 	beforeHook := func(connID nbnet.ConnectionID, ip net.IP) error {
 		prefix, err := util.GetPrefixFromIP(ip)
 		if err != nil {
 			return fmt.Errorf("convert ip to prefix: %w", err)
 		}
 
-		if _, err := r.refCounter.IncrementWithID(string(connID), prefix, nil); err != nil {
+		if _, err := r.refCounter.IncrementWithID(string(connID), prefix, struct{}{}); err != nil {
 			return fmt.Errorf("adding route reference: %v", err)
 		}
+
+		r.updateState(stateManager)
 
 		return nil
 	}
@@ -327,6 +344,8 @@ func (r *SysOps) setupHooks(initAddresses []net.IP) (nbnet.AddHookFunc, nbnet.Re
 		if err := r.refCounter.DecrementWithID(string(connID)); err != nil {
 			return fmt.Errorf("remove route reference: %w", err)
 		}
+
+		r.updateState(stateManager)
 
 		return nil
 	}
