@@ -9,21 +9,27 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/mock/gomock"
 	"github.com/rs/xid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/netbirdio/netbird/management/internals/controllers/network_map/controller"
+	"github.com/netbirdio/netbird/management/internals/controllers/network_map/update_channel"
+	"github.com/netbirdio/netbird/management/internals/server/config"
+	"github.com/netbirdio/netbird/management/server/activity"
+	"github.com/netbirdio/netbird/management/server/integrations/port_forwarding"
 	resourceTypes "github.com/netbirdio/netbird/management/server/networks/resources/types"
 	routerTypes "github.com/netbirdio/netbird/management/server/networks/routers/types"
 	networkTypes "github.com/netbirdio/netbird/management/server/networks/types"
-
-	"github.com/netbirdio/netbird/management/domain"
-	"github.com/netbirdio/netbird/management/server/activity"
 	nbpeer "github.com/netbirdio/netbird/management/server/peer"
+	"github.com/netbirdio/netbird/management/server/permissions"
+	"github.com/netbirdio/netbird/management/server/settings"
 	"github.com/netbirdio/netbird/management/server/store"
 	"github.com/netbirdio/netbird/management/server/telemetry"
 	"github.com/netbirdio/netbird/management/server/types"
 	"github.com/netbirdio/netbird/route"
+	"github.com/netbirdio/netbird/shared/management/domain"
 )
 
 const (
@@ -66,6 +72,7 @@ func TestCreateRoute(t *testing.T) {
 		enabled             bool
 		groups              []string
 		accessControlGroups []string
+		skipAutoApply       bool
 	}
 
 	testCases := []struct {
@@ -428,7 +435,7 @@ func TestCreateRoute(t *testing.T) {
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			am, err := createRouterManager(t)
+			am, _, err := createRouterManager(t)
 			if err != nil {
 				t.Error("failed to create account manager")
 			}
@@ -441,13 +448,13 @@ func TestCreateRoute(t *testing.T) {
 			if testCase.createInitRoute {
 				groupAll, errInit := account.GetGroupAll()
 				require.NoError(t, errInit)
-				_, errInit = am.CreateRoute(context.Background(), account.Id, existingNetwork, 1, nil, "", []string{routeGroup3, routeGroup4}, "", existingRouteID, false, 1000, []string{groupAll.ID}, []string{}, true, userID, false)
+				_, errInit = am.CreateRoute(context.Background(), account.Id, existingNetwork, 1, nil, "", []string{routeGroup3, routeGroup4}, "", existingRouteID, false, 1000, []string{groupAll.ID}, []string{}, true, userID, false, true)
 				require.NoError(t, errInit)
-				_, errInit = am.CreateRoute(context.Background(), account.Id, netip.Prefix{}, 3, existingDomains, "", []string{routeGroup3, routeGroup4}, "", existingRouteID, false, 1000, []string{groupAll.ID}, []string{groupAll.ID}, true, userID, false)
+				_, errInit = am.CreateRoute(context.Background(), account.Id, netip.Prefix{}, 3, existingDomains, "", []string{routeGroup3, routeGroup4}, "", existingRouteID, false, 1000, []string{groupAll.ID}, []string{groupAll.ID}, true, userID, false, true)
 				require.NoError(t, errInit)
 			}
 
-			outRoute, err := am.CreateRoute(context.Background(), account.Id, testCase.inputArgs.network, testCase.inputArgs.networkType, testCase.inputArgs.domains, testCase.inputArgs.peerKey, testCase.inputArgs.peerGroupIDs, testCase.inputArgs.description, testCase.inputArgs.netID, testCase.inputArgs.masquerade, testCase.inputArgs.metric, testCase.inputArgs.groups, testCase.inputArgs.accessControlGroups, testCase.inputArgs.enabled, userID, testCase.inputArgs.keepRoute)
+			outRoute, err := am.CreateRoute(context.Background(), account.Id, testCase.inputArgs.network, testCase.inputArgs.networkType, testCase.inputArgs.domains, testCase.inputArgs.peerKey, testCase.inputArgs.peerGroupIDs, testCase.inputArgs.description, testCase.inputArgs.netID, testCase.inputArgs.masquerade, testCase.inputArgs.metric, testCase.inputArgs.groups, testCase.inputArgs.accessControlGroups, testCase.inputArgs.enabled, userID, testCase.inputArgs.keepRoute, testCase.inputArgs.skipAutoApply)
 
 			testCase.errFunc(t, err)
 
@@ -458,7 +465,7 @@ func TestCreateRoute(t *testing.T) {
 			// assign generated ID
 			testCase.expectedRoute.ID = outRoute.ID
 
-			if !testCase.expectedRoute.IsEqual(outRoute) {
+			if !testCase.expectedRoute.Equal(outRoute) {
 				t.Errorf("new route didn't match expected route:\nGot %#v\nExpected:%#v\n", outRoute, testCase.expectedRoute)
 			}
 		})
@@ -918,7 +925,7 @@ func TestSaveRoute(t *testing.T) {
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			am, err := createRouterManager(t)
+			am, _, err := createRouterManager(t)
 			if err != nil {
 				t.Error("failed to create account manager")
 			}
@@ -999,7 +1006,7 @@ func TestSaveRoute(t *testing.T) {
 			savedRoute, saved := account.Routes[testCase.expectedRoute.ID]
 			require.True(t, saved)
 
-			if !testCase.expectedRoute.IsEqual(savedRoute) {
+			if !testCase.expectedRoute.Equal(savedRoute) {
 				t.Errorf("new route didn't match expected route:\nGot %#v\nExpected:%#v\n", savedRoute, testCase.expectedRoute)
 			}
 		})
@@ -1020,7 +1027,7 @@ func TestDeleteRoute(t *testing.T) {
 		Enabled:     true,
 	}
 
-	am, err := createRouterManager(t)
+	am, _, err := createRouterManager(t)
 	if err != nil {
 		t.Error("failed to create account manager")
 	}
@@ -1067,7 +1074,7 @@ func TestGetNetworkMap_RouteSyncPeerGroups(t *testing.T) {
 		AccessControlGroups: []string{routeGroup1},
 	}
 
-	am, err := createRouterManager(t)
+	am, _, err := createRouterManager(t)
 	if err != nil {
 		t.Error("failed to create account manager")
 	}
@@ -1081,7 +1088,7 @@ func TestGetNetworkMap_RouteSyncPeerGroups(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, newAccountRoutes.Routes, 0, "new accounts should have no routes")
 
-	newRoute, err := am.CreateRoute(context.Background(), account.Id, baseRoute.Network, baseRoute.NetworkType, baseRoute.Domains, baseRoute.Peer, baseRoute.PeerGroups, baseRoute.Description, baseRoute.NetID, baseRoute.Masquerade, baseRoute.Metric, baseRoute.Groups, baseRoute.AccessControlGroups, baseRoute.Enabled, userID, baseRoute.KeepRoute)
+	newRoute, err := am.CreateRoute(context.Background(), account.Id, baseRoute.Network, baseRoute.NetworkType, baseRoute.Domains, baseRoute.Peer, baseRoute.PeerGroups, baseRoute.Description, baseRoute.NetID, baseRoute.Masquerade, baseRoute.Metric, baseRoute.Groups, baseRoute.AccessControlGroups, baseRoute.Enabled, userID, baseRoute.KeepRoute, baseRoute.SkipAutoApply)
 	require.NoError(t, err)
 	require.Equal(t, newRoute.Enabled, true)
 
@@ -1097,7 +1104,7 @@ func TestGetNetworkMap_RouteSyncPeerGroups(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, peer4Routes.Routes, 1, "HA route should have 1 server route")
 
-	groups, err := am.Store.GetAccountGroups(context.Background(), store.LockingStrengthShare, account.Id)
+	groups, err := am.Store.GetAccountGroups(context.Background(), store.LockingStrengthNone, account.Id)
 	require.NoError(t, err)
 	var groupHA1, groupHA2 *types.Group
 	for _, group := range groups {
@@ -1114,14 +1121,14 @@ func TestGetNetworkMap_RouteSyncPeerGroups(t *testing.T) {
 
 	peer2RoutesAfterDelete, err := am.GetNetworkMap(context.Background(), peer2ID)
 	require.NoError(t, err)
-	assert.Len(t, peer2RoutesAfterDelete.Routes, 2, "after peer deletion group should have 2 client routes")
+	assert.Len(t, peer2RoutesAfterDelete.Routes, 3, "after peer deletion group should have 3 client routes")
 
 	err = am.GroupDeletePeer(context.Background(), account.Id, groupHA2.ID, peer4ID)
 	require.NoError(t, err)
 
 	peer2RoutesAfterDelete, err = am.GetNetworkMap(context.Background(), peer2ID)
 	require.NoError(t, err)
-	assert.Len(t, peer2RoutesAfterDelete.Routes, 1, "after peer deletion group should have only 1 route")
+	assert.Len(t, peer2RoutesAfterDelete.Routes, 2, "after peer deletion group should have only 2 routes")
 
 	err = am.GroupAddPeer(context.Background(), account.Id, groupHA2.ID, peer4ID)
 	require.NoError(t, err)
@@ -1132,7 +1139,7 @@ func TestGetNetworkMap_RouteSyncPeerGroups(t *testing.T) {
 
 	peer2RoutesAfterAdd, err := am.GetNetworkMap(context.Background(), peer2ID)
 	require.NoError(t, err)
-	assert.Len(t, peer2RoutesAfterAdd.Routes, 2, "HA route should have 2 client routes")
+	assert.Len(t, peer2RoutesAfterAdd.Routes, 3, "HA route should have 3 client routes")
 
 	err = am.DeleteRoute(context.Background(), account.Id, newRoute.ID, userID)
 	require.NoError(t, err)
@@ -1159,7 +1166,7 @@ func TestGetNetworkMap_RouteSync(t *testing.T) {
 		AccessControlGroups: []string{routeGroup1},
 	}
 
-	am, err := createRouterManager(t)
+	am, _, err := createRouterManager(t)
 	if err != nil {
 		t.Error("failed to create account manager")
 	}
@@ -1173,7 +1180,7 @@ func TestGetNetworkMap_RouteSync(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, newAccountRoutes.Routes, 0, "new accounts should have no routes")
 
-	createdRoute, err := am.CreateRoute(context.Background(), account.Id, baseRoute.Network, baseRoute.NetworkType, baseRoute.Domains, peer1ID, []string{}, baseRoute.Description, baseRoute.NetID, baseRoute.Masquerade, baseRoute.Metric, baseRoute.Groups, baseRoute.AccessControlGroups, false, userID, baseRoute.KeepRoute)
+	createdRoute, err := am.CreateRoute(context.Background(), account.Id, baseRoute.Network, baseRoute.NetworkType, baseRoute.Domains, peer1ID, []string{}, baseRoute.Description, baseRoute.NetID, baseRoute.Masquerade, baseRoute.Metric, baseRoute.Groups, baseRoute.AccessControlGroups, false, userID, baseRoute.KeepRoute, baseRoute.SkipAutoApply)
 	require.NoError(t, err)
 
 	noDisabledRoutes, err := am.GetNetworkMap(context.Background(), peer1ID)
@@ -1193,7 +1200,7 @@ func TestGetNetworkMap_RouteSync(t *testing.T) {
 	peer1Routes, err := am.GetNetworkMap(context.Background(), peer1ID)
 	require.NoError(t, err)
 	require.Len(t, peer1Routes.Routes, 1, "we should receive one route for peer1")
-	require.True(t, expectedRoute.IsEqual(peer1Routes.Routes[0]), "received route should be equal")
+	require.True(t, expectedRoute.Equal(peer1Routes.Routes[0]), "received route should be equal")
 
 	peer2Routes, err := am.GetNetworkMap(context.Background(), peer2ID)
 	require.NoError(t, err)
@@ -1205,14 +1212,14 @@ func TestGetNetworkMap_RouteSync(t *testing.T) {
 	peer2Routes, err = am.GetNetworkMap(context.Background(), peer2ID)
 	require.NoError(t, err)
 	require.Len(t, peer2Routes.Routes, 1, "we should receive one route")
-	require.True(t, peer1Routes.Routes[0].IsEqual(peer2Routes.Routes[0]), "routes should be the same for peers in the same group")
+	require.True(t, peer1Routes.Routes[0].Equal(peer2Routes.Routes[0]), "routes should be the same for peers in the same group")
 
 	newGroup := &types.Group{
 		ID:    xid.New().String(),
 		Name:  "peer1 group",
 		Peers: []string{peer1ID},
 	}
-	err = am.SaveGroup(context.Background(), account.Id, userID, newGroup)
+	err = am.CreateGroup(context.Background(), account.Id, userID, newGroup)
 	require.NoError(t, err)
 
 	rules, err := am.ListPolicies(context.Background(), account.Id, "testingUser")
@@ -1224,7 +1231,7 @@ func TestGetNetworkMap_RouteSync(t *testing.T) {
 	newPolicy.Rules[0].Sources = []string{newGroup.ID}
 	newPolicy.Rules[0].Destinations = []string{newGroup.ID}
 
-	_, err = am.SavePolicy(context.Background(), account.Id, userID, newPolicy)
+	_, err = am.SavePolicy(context.Background(), account.Id, userID, newPolicy, true)
 	require.NoError(t, err)
 
 	err = am.DeletePolicy(context.Background(), account.Id, defaultRule.ID, userID)
@@ -1246,18 +1253,51 @@ func TestGetNetworkMap_RouteSync(t *testing.T) {
 	require.Len(t, peer1DeletedRoute.Routes, 0, "we should receive one route for peer1")
 }
 
-func createRouterManager(t *testing.T) (*DefaultAccountManager, error) {
+func createRouterManager(t *testing.T) (*DefaultAccountManager, *update_channel.PeersUpdateManager, error) {
 	t.Helper()
 	store, err := createRouterStore(t)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	eventStore := &activity.InMemoryEventStore{}
 
 	metrics, err := telemetry.NewDefaultAppMetrics(context.Background())
 	require.NoError(t, err)
 
-	return BuildManager(context.Background(), store, NewPeersUpdateManager(nil), nil, "", "netbird.selfhosted", eventStore, nil, false, MocIntegratedValidator{}, metrics)
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	settingsMockManager := settings.NewMockManager(ctrl)
+	settingsMockManager.
+		EXPECT().
+		GetSettings(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+		).
+		Return(nil, nil).
+		AnyTimes()
+	settingsMockManager.
+		EXPECT().
+		GetExtraSettings(
+			gomock.Any(),
+			gomock.Any(),
+		).
+		AnyTimes().
+		Return(&types.ExtraSettings{}, nil)
+
+	permissionsManager := permissions.NewManager(store)
+
+	ctx := context.Background()
+	updateManager := update_channel.NewPeersUpdateManager(metrics)
+	requestBuffer := NewAccountRequestBuffer(ctx, store)
+	networkMapController := controller.NewController(ctx, store, metrics, updateManager, requestBuffer, MockIntegratedValidator{}, settingsMockManager, "netbird.selfhosted", port_forwarding.NewControllerMock(), &config.Config{})
+
+	am, err := BuildManager(context.Background(), nil, store, networkMapController, nil, "", eventStore, nil, false, MockIntegratedValidator{}, metrics, port_forwarding.NewControllerMock(), settingsMockManager, permissionsManager, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	return am, updateManager, nil
 }
 
 func createRouterStore(t *testing.T) (store.Store, error) {
@@ -1278,7 +1318,7 @@ func initTestRouteAccount(t *testing.T, am *DefaultAccountManager) (*types.Accou
 	accountID := "testingAcc"
 	domain := "example.com"
 
-	account := newAccountWithId(context.Background(), accountID, userID, domain)
+	account := newAccountWithId(context.Background(), accountID, userID, domain, false)
 	err := am.Store.SaveAccount(context.Background(), account)
 	if err != nil {
 		return nil, err
@@ -1468,7 +1508,7 @@ func initTestRouteAccount(t *testing.T, am *DefaultAccountManager) (*types.Accou
 		{
 			ID:    routeGroupHA1,
 			Name:  routeGroupHA1,
-			Peers: []string{peer1.ID, peer2.ID, peer3.ID}, // we have one non Linux peer, see peer3
+			Peers: []string{peer1.ID, peer2.ID, peer3.ID},
 		},
 		{
 			ID:    routeGroupHA2,
@@ -1478,7 +1518,7 @@ func initTestRouteAccount(t *testing.T, am *DefaultAccountManager) (*types.Accou
 	}
 
 	for _, group := range newGroup {
-		err = am.SaveGroup(context.Background(), accountID, userID, group)
+		err = am.CreateGroup(context.Background(), accountID, userID, group)
 		if err != nil {
 			return nil, err
 		}
@@ -1823,6 +1863,7 @@ func TestAccount_getPeersRoutesFirewall(t *testing.T) {
 				Destination: "192.168.0.0/16",
 				Protocol:    "all",
 				Port:        80,
+				RouteID:     "route1:peerA",
 			},
 			{
 				SourceRanges: []string{
@@ -1834,6 +1875,7 @@ func TestAccount_getPeersRoutesFirewall(t *testing.T) {
 				Destination: "192.168.0.0/16",
 				Protocol:    "all",
 				Port:        320,
+				RouteID:     "route1:peerA",
 			},
 		}
 		additionalFirewallRule := []*types.RouteFirewallRule{
@@ -1845,6 +1887,7 @@ func TestAccount_getPeersRoutesFirewall(t *testing.T) {
 				Destination: "192.168.10.0/16",
 				Protocol:    "tcp",
 				Port:        80,
+				RouteID:     "route4:peerA",
 			},
 			{
 				SourceRanges: []string{
@@ -1853,6 +1896,7 @@ func TestAccount_getPeersRoutesFirewall(t *testing.T) {
 				Action:      "accept",
 				Destination: "192.168.10.0/16",
 				Protocol:    "all",
+				RouteID:     "route4:peerA",
 			},
 		}
 
@@ -1861,6 +1905,9 @@ func TestAccount_getPeersRoutesFirewall(t *testing.T) {
 		// peerD is also the routing peer for route1, should contain same routes firewall rules as peerA
 		routesFirewallRules = account.GetPeerRoutesFirewallRules(context.Background(), "peerD", validatedPeers)
 		assert.Len(t, routesFirewallRules, 2)
+		for _, rule := range expectedRoutesFirewallRules {
+			rule.RouteID = "route1:peerD"
+		}
 		assert.ElementsMatch(t, orderRuleSourceRanges(routesFirewallRules), orderRuleSourceRanges(expectedRoutesFirewallRules))
 
 		// peerE is a single routing peer for route 2 and route 3
@@ -1874,6 +1921,7 @@ func TestAccount_getPeersRoutesFirewall(t *testing.T) {
 				Destination:  existingNetwork.String(),
 				Protocol:     "tcp",
 				PortRange:    types.RulePortRange{Start: 80, End: 350},
+				RouteID:      "route2",
 			},
 			{
 				SourceRanges: []string{"0.0.0.0/0"},
@@ -1882,6 +1930,7 @@ func TestAccount_getPeersRoutesFirewall(t *testing.T) {
 				Protocol:     "all",
 				Domains:      domain.List{"example.com"},
 				IsDynamic:    true,
+				RouteID:      "route3",
 			},
 			{
 				SourceRanges: []string{"::/0"},
@@ -1890,6 +1939,7 @@ func TestAccount_getPeersRoutesFirewall(t *testing.T) {
 				Protocol:     "all",
 				Domains:      domain.List{"example.com"},
 				IsDynamic:    true,
+				RouteID:      "route3",
 			},
 		}
 		assert.ElementsMatch(t, orderRuleSourceRanges(routesFirewallRules), orderRuleSourceRanges(expectedRoutesFirewallRules))
@@ -1910,13 +1960,13 @@ func orderRuleSourceRanges(ruleList []*types.RouteFirewallRule) []*types.RouteFi
 }
 
 func TestRouteAccountPeersUpdate(t *testing.T) {
-	manager, err := createRouterManager(t)
+	manager, updateManager, err := createRouterManager(t)
 	require.NoError(t, err, "failed to create account manager")
 
 	account, err := initTestRouteAccount(t, manager)
 	require.NoError(t, err, "failed to init testing account")
 
-	err = manager.SaveGroups(context.Background(), account.Id, userID, []*types.Group{
+	g := []*types.Group{
 		{
 			ID:    "groupA",
 			Name:  "GroupA",
@@ -1932,12 +1982,15 @@ func TestRouteAccountPeersUpdate(t *testing.T) {
 			Name:  "GroupC",
 			Peers: []string{},
 		},
-	})
-	assert.NoError(t, err)
+	}
+	for _, group := range g {
+		err = manager.CreateGroup(context.Background(), account.Id, userID, group)
+		require.NoError(t, err, "failed to create group %s", group.Name)
+	}
 
-	updMsg := manager.peersUpdateManager.CreateChannel(context.Background(), peer1ID)
+	updMsg := updateManager.CreateChannel(context.Background(), peer1ID)
 	t.Cleanup(func() {
-		manager.peersUpdateManager.CloseChannel(context.Background(), peer1ID)
+		updateManager.CloseChannel(context.Background(), peer1ID)
 	})
 
 	// Creating a route with no routing peer and no peers in PeerGroups or Groups should not update account peers and not send peer update
@@ -1964,7 +2017,7 @@ func TestRouteAccountPeersUpdate(t *testing.T) {
 		_, err := manager.CreateRoute(
 			context.Background(), account.Id, route.Network, route.NetworkType, route.Domains, route.Peer,
 			route.PeerGroups, route.Description, route.NetID, route.Masquerade, route.Metric,
-			route.Groups, []string{}, true, userID, route.KeepRoute,
+			route.Groups, []string{}, true, userID, route.KeepRoute, route.SkipAutoApply,
 		)
 		require.NoError(t, err)
 
@@ -2000,7 +2053,7 @@ func TestRouteAccountPeersUpdate(t *testing.T) {
 		_, err := manager.CreateRoute(
 			context.Background(), account.Id, route.Network, route.NetworkType, route.Domains, route.Peer,
 			route.PeerGroups, route.Description, route.NetID, route.Masquerade, route.Metric,
-			route.Groups, []string{}, true, userID, route.KeepRoute,
+			route.Groups, []string{}, true, userID, route.KeepRoute, route.SkipAutoApply,
 		)
 		require.NoError(t, err)
 
@@ -2036,7 +2089,7 @@ func TestRouteAccountPeersUpdate(t *testing.T) {
 		newRoute, err := manager.CreateRoute(
 			context.Background(), account.Id, baseRoute.Network, baseRoute.NetworkType, baseRoute.Domains, baseRoute.Peer,
 			baseRoute.PeerGroups, baseRoute.Description, baseRoute.NetID, baseRoute.Masquerade, baseRoute.Metric,
-			baseRoute.Groups, []string{}, true, userID, baseRoute.KeepRoute,
+			baseRoute.Groups, []string{}, true, userID, baseRoute.KeepRoute, !baseRoute.SkipAutoApply,
 		)
 		require.NoError(t, err)
 		baseRoute = *newRoute
@@ -2102,7 +2155,7 @@ func TestRouteAccountPeersUpdate(t *testing.T) {
 		_, err := manager.CreateRoute(
 			context.Background(), account.Id, newRoute.Network, newRoute.NetworkType, newRoute.Domains, newRoute.Peer,
 			newRoute.PeerGroups, newRoute.Description, newRoute.NetID, newRoute.Masquerade, newRoute.Metric,
-			newRoute.Groups, []string{}, true, userID, newRoute.KeepRoute,
+			newRoute.Groups, []string{}, true, userID, newRoute.KeepRoute, !newRoute.SkipAutoApply,
 		)
 		require.NoError(t, err)
 
@@ -2112,7 +2165,7 @@ func TestRouteAccountPeersUpdate(t *testing.T) {
 			close(done)
 		}()
 
-		err = manager.SaveGroup(context.Background(), account.Id, userID, &types.Group{
+		err = manager.UpdateGroup(context.Background(), account.Id, userID, &types.Group{
 			ID:    "groupB",
 			Name:  "GroupB",
 			Peers: []string{peer1ID},
@@ -2142,7 +2195,7 @@ func TestRouteAccountPeersUpdate(t *testing.T) {
 		_, err := manager.CreateRoute(
 			context.Background(), account.Id, newRoute.Network, newRoute.NetworkType, newRoute.Domains, newRoute.Peer,
 			newRoute.PeerGroups, newRoute.Description, newRoute.NetID, newRoute.Masquerade, newRoute.Metric,
-			newRoute.Groups, []string{}, true, userID, newRoute.KeepRoute,
+			newRoute.Groups, []string{}, true, userID, newRoute.KeepRoute, !newRoute.SkipAutoApply,
 		)
 		require.NoError(t, err)
 
@@ -2152,7 +2205,7 @@ func TestRouteAccountPeersUpdate(t *testing.T) {
 			close(done)
 		}()
 
-		err = manager.SaveGroup(context.Background(), account.Id, userID, &types.Group{
+		err = manager.UpdateGroup(context.Background(), account.Id, userID, &types.Group{
 			ID:    "groupC",
 			Name:  "GroupC",
 			Peers: []string{peer1ID},
@@ -2649,6 +2702,7 @@ func TestAccount_GetPeerNetworkResourceFirewallRules(t *testing.T) {
 				Destination: "192.168.0.0/16",
 				Protocol:    "all",
 				Port:        80,
+				RouteID:     "resource2:peerA",
 			},
 			{
 				SourceRanges: []string{
@@ -2660,6 +2714,7 @@ func TestAccount_GetPeerNetworkResourceFirewallRules(t *testing.T) {
 				Destination: "192.168.0.0/16",
 				Protocol:    "all",
 				Port:        320,
+				RouteID:     "resource2:peerA",
 			},
 		}
 
@@ -2674,6 +2729,7 @@ func TestAccount_GetPeerNetworkResourceFirewallRules(t *testing.T) {
 				Port:        80,
 				Domains:     domain.List{"example.com"},
 				IsDynamic:   true,
+				RouteID:     "resource4:peerA",
 			},
 			{
 				SourceRanges: []string{
@@ -2684,6 +2740,7 @@ func TestAccount_GetPeerNetworkResourceFirewallRules(t *testing.T) {
 				Protocol:    "all",
 				Domains:     domain.List{"example.com"},
 				IsDynamic:   true,
+				RouteID:     "resource4:peerA",
 			},
 		}
 		assert.ElementsMatch(t, orderRuleSourceRanges(firewallRules), orderRuleSourceRanges(append(expectedFirewallRules, additionalFirewallRules...)))
@@ -2692,6 +2749,9 @@ func TestAccount_GetPeerNetworkResourceFirewallRules(t *testing.T) {
 		_, routes, sourcePeers = account.GetNetworkResourcesRoutesToSync(context.Background(), "peerD", resourcePoliciesMap, resourceRoutersMap)
 		firewallRules = account.GetPeerNetworkResourceFirewallRules(context.Background(), account.Peers["peerD"], validatedPeers, routes, resourcePoliciesMap)
 		assert.Len(t, firewallRules, 2)
+		for _, rule := range expectedFirewallRules {
+			rule.RouteID = "resource2:peerD"
+		}
 		assert.ElementsMatch(t, orderRuleSourceRanges(firewallRules), orderRuleSourceRanges(expectedFirewallRules))
 		assert.Len(t, sourcePeers, 3)
 
@@ -2709,6 +2769,7 @@ func TestAccount_GetPeerNetworkResourceFirewallRules(t *testing.T) {
 				Destination:  "10.10.10.0/24",
 				Protocol:     "tcp",
 				PortRange:    types.RulePortRange{Start: 80, End: 350},
+				RouteID:      "resource1:peerE",
 			},
 		}
 		assert.ElementsMatch(t, orderRuleSourceRanges(firewallRules), orderRuleSourceRanges(expectedFirewallRules))
@@ -2731,6 +2792,7 @@ func TestAccount_GetPeerNetworkResourceFirewallRules(t *testing.T) {
 				Destination:  "10.12.12.1/32",
 				Protocol:     "tcp",
 				Port:         8080,
+				RouteID:      "resource5:peerL",
 			},
 		}
 		assert.ElementsMatch(t, orderRuleSourceRanges(firewallRules), orderRuleSourceRanges(expectedFirewallRules))

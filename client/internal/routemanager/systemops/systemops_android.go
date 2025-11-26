@@ -10,14 +10,13 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/netbirdio/netbird/client/internal/statemanager"
-	nbnet "github.com/netbirdio/netbird/util/net"
 )
 
-func (r *SysOps) SetupRouting([]net.IP, *statemanager.Manager) (nbnet.AddHookFunc, nbnet.RemoveHookFunc, error) {
-	return nil, nil, nil
+func (r *SysOps) SetupRouting([]net.IP, *statemanager.Manager, bool) error {
+	return nil
 }
 
-func (r *SysOps) CleanupRouting(*statemanager.Manager) error {
+func (r *SysOps) CleanupRouting(*statemanager.Manager, bool) error {
 	return nil
 }
 

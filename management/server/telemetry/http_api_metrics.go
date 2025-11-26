@@ -13,7 +13,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
-	"github.com/netbirdio/netbird/formatter"
+	"github.com/netbirdio/netbird/formatter/hook"
 	nbContext "github.com/netbirdio/netbird/management/server/context"
 )
 
@@ -74,37 +74,58 @@ type HTTPMiddleware struct {
 
 // NewMetricsMiddleware creates a new HTTPMiddleware
 func NewMetricsMiddleware(ctx context.Context, meter metric.Meter) (*HTTPMiddleware, error) {
-	httpRequestCounter, err := meter.Int64Counter(httpRequestCounterPrefix, metric.WithUnit("1"))
+	httpRequestCounter, err := meter.Int64Counter(httpRequestCounterPrefix,
+		metric.WithUnit("1"),
+		metric.WithDescription("Number of incoming HTTP requests by endpoint and method"),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	httpResponseCounter, err := meter.Int64Counter(httpResponseCounterPrefix, metric.WithUnit("1"))
+	httpResponseCounter, err := meter.Int64Counter(httpResponseCounterPrefix,
+		metric.WithUnit("1"),
+		metric.WithDescription("Number of outgoing HTTP responses by endpoint, method and returned status code"),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	totalHTTPRequestsCounter, err := meter.Int64Counter(fmt.Sprintf("%s.total", httpRequestCounterPrefix), metric.WithUnit("1"))
+	totalHTTPRequestsCounter, err := meter.Int64Counter(fmt.Sprintf("%s.total", httpRequestCounterPrefix),
+		metric.WithUnit("1"),
+		metric.WithDescription("Number of incoming HTTP requests"),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	totalHTTPResponseCounter, err := meter.Int64Counter(fmt.Sprintf("%s.total", httpResponseCounterPrefix), metric.WithUnit("1"))
+	totalHTTPResponseCounter, err := meter.Int64Counter(fmt.Sprintf("%s.total", httpResponseCounterPrefix),
+		metric.WithUnit("1"),
+		metric.WithDescription("Number of outgoing HTTP responses"),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	totalHTTPResponseCodeCounter, err := meter.Int64Counter(fmt.Sprintf("%s.code.total", httpResponseCounterPrefix), metric.WithUnit("1"))
+	totalHTTPResponseCodeCounter, err := meter.Int64Counter(fmt.Sprintf("%s.code.total", httpResponseCounterPrefix),
+		metric.WithUnit("1"),
+		metric.WithDescription("Number of outgoing HTTP responses by status code"),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	httpRequestDuration, err := meter.Int64Histogram(httpRequestDurationPrefix, metric.WithUnit("milliseconds"))
+	httpRequestDuration, err := meter.Int64Histogram(httpRequestDurationPrefix,
+		metric.WithUnit("milliseconds"),
+		metric.WithDescription("Duration of incoming HTTP requests by endpoint and method"),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	totalHTTPRequestDuration, err := meter.Int64Histogram(fmt.Sprintf("%s.total", httpRequestDurationPrefix), metric.WithUnit("milliseconds"))
+	totalHTTPRequestDuration, err := meter.Int64Histogram(fmt.Sprintf("%s.total", httpRequestDurationPrefix),
+		metric.WithUnit("milliseconds"),
+		metric.WithDescription("Duration of incoming HTTP requests"),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +167,7 @@ func (m *HTTPMiddleware) Handler(h http.Handler) http.Handler {
 		reqStart := time.Now()
 
 		//nolint
-		ctx := context.WithValue(r.Context(), formatter.ExecutionContextKey, formatter.HTTPSource)
+		ctx := context.WithValue(r.Context(), hook.ExecutionContextKey, hook.HTTPSource)
 
 		reqID := uuid.New().String()
 		//nolint

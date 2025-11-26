@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os/exec"
+	"strings"
 
 	log "github.com/sirupsen/logrus"
 
@@ -15,23 +16,64 @@ import (
 
 const resolvconfCommand = "resolvconf"
 
+// resolvconfType represents the type of resolvconf implementation
+type resolvconfType int
+
+func (r resolvconfType) String() string {
+	switch r {
+	case typeOpenresolv:
+		return "openresolv"
+	case typeResolvconf:
+		return "resolvconf"
+	default:
+		return "unknown"
+	}
+}
+
+const (
+	typeOpenresolv resolvconfType = iota
+	typeResolvconf
+)
+
 type resolvconf struct {
 	ifaceName string
+	implType  resolvconfType
 
 	originalSearchDomains []string
-	originalNameServers   []string
+	originalNameServers   []netip.Addr
 	othersConfigs         []string
 }
 
-// supported "openresolv" only
+func detectResolvconfType() (resolvconfType, error) {
+	cmd := exec.Command(resolvconfCommand, "--version")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return typeOpenresolv, fmt.Errorf("determine resolvconf type: %w", err)
+	}
+
+	if strings.Contains(string(out), "openresolv") {
+		return typeOpenresolv, nil
+	}
+	return typeResolvconf, nil
+}
+
 func newResolvConfConfigurator(wgInterface string) (*resolvconf, error) {
 	resolvConfEntries, err := parseDefaultResolvConf()
 	if err != nil {
 		log.Errorf("could not read original search domains from %s: %s", defaultResolvConfPath, err)
 	}
 
+	implType, err := detectResolvconfType()
+	if err != nil {
+		log.Warnf("failed to detect resolvconf type, defaulting to openresolv: %v", err)
+		implType = typeResolvconf
+	} else {
+		log.Infof("detected resolvconf type: %v", implType)
+	}
+
 	return &resolvconf{
 		ifaceName:             wgInterface,
+		implType:              implType,
 		originalSearchDomains: resolvConfEntries.searchDomains,
 		originalNameServers:   resolvConfEntries.nameServers,
 		othersConfigs:         resolvConfEntries.others,
@@ -43,24 +85,14 @@ func (r *resolvconf) supportCustomPort() bool {
 }
 
 func (r *resolvconf) applyDNSConfig(config HostDNSConfig, stateManager *statemanager.Manager) error {
-	var err error
-	if !config.RouteAll {
-		err = r.restoreHostDNS()
-		if err != nil {
-			log.Errorf("restore host dns: %s", err)
-		}
-		return fmt.Errorf("unable to configure DNS for this peer using resolvconf manager without a nameserver group with all domains configured")
-	}
-
 	searchDomainList := searchDomains(config)
 	searchDomainList = mergeSearchDomains(searchDomainList, r.originalSearchDomains)
 
-	options := prepareOptionsWithTimeout(r.othersConfigs, int(dnsFailoverTimeout.Seconds()), dnsFailoverAttempts)
-
 	buf := prepareResolvConfContent(
 		searchDomainList,
-		append([]string{config.ServerIP}, r.originalNameServers...),
-		options)
+		[]string{config.ServerIP.String()},
+		r.othersConfigs,
+	)
 
 	state := &ShutdownState{
 		ManagerType: resolvConfManager,
@@ -70,8 +102,7 @@ func (r *resolvconf) applyDNSConfig(config HostDNSConfig, stateManager *stateman
 		log.Errorf("failed to update shutdown state: %s", err)
 	}
 
-	err = r.applyConfig(buf)
-	if err != nil {
+	if err := r.applyConfig(buf); err != nil {
 		return fmt.Errorf("apply config: %w", err)
 	}
 
@@ -79,9 +110,20 @@ func (r *resolvconf) applyDNSConfig(config HostDNSConfig, stateManager *stateman
 	return nil
 }
 
+func (r *resolvconf) getOriginalNameservers() []netip.Addr {
+	return r.originalNameServers
+}
+
 func (r *resolvconf) restoreHostDNS() error {
-	// openresolv only, debian resolvconf doesn't support "-f"
-	cmd := exec.Command(resolvconfCommand, "-f", "-d", r.ifaceName)
+	var cmd *exec.Cmd
+
+	switch r.implType {
+	case typeOpenresolv:
+		cmd = exec.Command(resolvconfCommand, "-f", "-d", r.ifaceName)
+	case typeResolvconf:
+		cmd = exec.Command(resolvconfCommand, "-d", r.ifaceName)
+	}
+
 	_, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("removing resolvconf configuration for %s interface: %w", r.ifaceName, err)
@@ -90,18 +132,33 @@ func (r *resolvconf) restoreHostDNS() error {
 	return nil
 }
 
+func (r *resolvconf) string() string {
+	return fmt.Sprintf("resolvconf (%s)", r.implType)
+}
+
 func (r *resolvconf) applyConfig(content bytes.Buffer) error {
-	// openresolv only, debian resolvconf doesn't support "-x"
-	cmd := exec.Command(resolvconfCommand, "-x", "-a", r.ifaceName)
+	var cmd *exec.Cmd
+
+	switch r.implType {
+	case typeOpenresolv:
+		// OpenResolv supports exclusive mode with -x
+		cmd = exec.Command(resolvconfCommand, "-x", "-a", r.ifaceName)
+	case typeResolvconf:
+		cmd = exec.Command(resolvconfCommand, "-a", r.ifaceName)
+	default:
+		return fmt.Errorf("unsupported resolvconf type: %v", r.implType)
+	}
+
 	cmd.Stdin = &content
-	_, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
+	log.Tracef("resolvconf output: %s", out)
 	if err != nil {
 		return fmt.Errorf("applying resolvconf configuration for %s interface: %w", r.ifaceName, err)
 	}
 	return nil
 }
 
-func (r *resolvconf) restoreUncleanShutdownDNS(*netip.Addr) error {
+func (r *resolvconf) restoreUncleanShutdownDNS(netip.Addr) error {
 	if err := r.restoreHostDNS(); err != nil {
 		return fmt.Errorf("restoring dns for interface %s: %w", r.ifaceName, err)
 	}

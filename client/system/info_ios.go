@@ -10,6 +10,11 @@ import (
 	"github.com/netbirdio/netbird/version"
 )
 
+// UpdateStaticInfoAsync is a no-op on Android as there is no static info to update
+func UpdateStaticInfoAsync() {
+	// do nothing
+}
+
 // GetInfo retrieves and parses the system information
 func GetInfo(ctx context.Context) *Info {
 
@@ -19,7 +24,7 @@ func GetInfo(ctx context.Context) *Info {
 
 	gio := &Info{Kernel: sysName, OSVersion: swVersion, Platform: "unknown", OS: sysName, GoOS: runtime.GOOS, CPUs: runtime.NumCPU(), KernelVersion: swVersion}
 	gio.Hostname = extractDeviceName(ctx, "hostname")
-	gio.WiretrusteeVersion = version.NetbirdVersion()
+	gio.NetbirdVersion = version.NetbirdVersion()
 	gio.UIVersion = extractUserAgent(ctx)
 
 	return gio

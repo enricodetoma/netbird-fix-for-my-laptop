@@ -2,25 +2,29 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"net/netip"
-	"reflect"
 	"testing"
 	"time"
 
+	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 
 	nbdns "github.com/netbirdio/netbird/dns"
+	"github.com/netbirdio/netbird/management/internals/controllers/network_map/controller"
+	"github.com/netbirdio/netbird/management/internals/controllers/network_map/update_channel"
+	"github.com/netbirdio/netbird/management/internals/server/config"
+	"github.com/netbirdio/netbird/management/server/integrations/port_forwarding"
+	"github.com/netbirdio/netbird/management/server/permissions"
+	"github.com/netbirdio/netbird/management/server/settings"
 	"github.com/netbirdio/netbird/management/server/store"
 	"github.com/netbirdio/netbird/management/server/telemetry"
 	"github.com/netbirdio/netbird/management/server/types"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/netbirdio/netbird/dns"
 	"github.com/netbirdio/netbird/management/server/activity"
 	nbpeer "github.com/netbirdio/netbird/management/server/peer"
-	"github.com/netbirdio/netbird/management/server/status"
+	"github.com/netbirdio/netbird/shared/management/status"
 )
 
 const (
@@ -42,7 +46,7 @@ func TestGetDNSSettings(t *testing.T) {
 
 	account, err := initTestDNSAccount(t, am)
 	if err != nil {
-		t.Fatal("failed to init testing account")
+		t.Fatalf("failed to init testing account: %s", err)
 	}
 
 	dnsSettings, err := am.GetDNSSettings(context.Background(), account.Id, dnsAdminUserID)
@@ -124,12 +128,12 @@ func TestSaveDNSSettings(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			am, err := createDNSManager(t)
 			if err != nil {
-				t.Error("failed to create account manager")
+				t.Fatalf("failed to create account manager")
 			}
 
 			account, err := initTestDNSAccount(t, am)
 			if err != nil {
-				t.Error("failed to init testing account")
+				t.Fatalf("failed to init testing account: %v", err)
 			}
 
 			err = am.SaveDNSSettings(context.Background(), account.Id, testCase.userID, testCase.inputSettings)
@@ -156,22 +160,22 @@ func TestGetNetworkMap_DNSConfigSync(t *testing.T) {
 
 	am, err := createDNSManager(t)
 	if err != nil {
-		t.Error("failed to create account manager")
+		t.Fatalf("failed to create account manager: %s", err)
 	}
 
 	account, err := initTestDNSAccount(t, am)
 	if err != nil {
-		t.Error("failed to init testing account")
+		t.Fatalf("failed to init testing account: %s", err)
 	}
 
 	peer1, err := account.FindPeerByPubKey(dnsPeer1Key)
 	if err != nil {
-		t.Error("failed to init testing account")
+		t.Fatalf("failed to init testing account: %s", err)
 	}
 
 	peer2, err := account.FindPeerByPubKey(dnsPeer2Key)
 	if err != nil {
-		t.Error("failed to init testing account")
+		t.Fatalf("failed to init testing account: %s", err)
 	}
 
 	newAccountDNSConfig, err := am.GetNetworkMap(context.Background(), peer1.ID)
@@ -208,7 +212,20 @@ func createDNSManager(t *testing.T) (*DefaultAccountManager, error) {
 	metrics, err := telemetry.NewDefaultAppMetrics(context.Background())
 	require.NoError(t, err)
 
-	return BuildManager(context.Background(), store, NewPeersUpdateManager(nil), nil, "", "netbird.test", eventStore, nil, false, MocIntegratedValidator{}, metrics)
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	settingsMockManager := settings.NewMockManager(ctrl)
+	// return empty extra settings for expected calls to UpdateAccountPeers
+	settingsMockManager.EXPECT().GetExtraSettings(gomock.Any(), gomock.Any()).Return(&types.ExtraSettings{}, nil).AnyTimes()
+	permissionsManager := permissions.NewManager(store)
+
+	ctx := context.Background()
+	updateManager := update_channel.NewPeersUpdateManager(metrics)
+	requestBuffer := NewAccountRequestBuffer(ctx, store)
+	networkMapController := controller.NewController(ctx, store, metrics, updateManager, requestBuffer, MockIntegratedValidator{}, settingsMockManager, "netbird.test", port_forwarding.NewControllerMock(), &config.Config{})
+
+	return BuildManager(context.Background(), nil, store, networkMapController, nil, "", eventStore, nil, false, MockIntegratedValidator{}, metrics, port_forwarding.NewControllerMock(), settingsMockManager, permissionsManager, false)
 }
 
 func createDNSStore(t *testing.T) (store.Store, error) {
@@ -258,7 +275,7 @@ func initTestDNSAccount(t *testing.T, am *DefaultAccountManager) (*types.Account
 
 	domain := "example.com"
 
-	account := newAccountWithId(context.Background(), dnsAccountID, dnsAdminUserID, domain)
+	account := newAccountWithId(context.Background(), dnsAccountID, dnsAdminUserID, domain, false)
 
 	account.Users[dnsRegularUserID] = &types.User{
 		Id:   dnsRegularUserID,
@@ -270,11 +287,11 @@ func initTestDNSAccount(t *testing.T, am *DefaultAccountManager) (*types.Account
 		return nil, err
 	}
 
-	savedPeer1, _, _, err := am.AddPeer(context.Background(), "", dnsAdminUserID, peer1)
+	savedPeer1, _, _, err := am.AddPeer(context.Background(), "", "", dnsAdminUserID, peer1, false)
 	if err != nil {
 		return nil, err
 	}
-	_, _, _, err = am.AddPeer(context.Background(), "", dnsAdminUserID, peer2)
+	_, _, _, err = am.AddPeer(context.Background(), "", "", dnsAdminUserID, peer2, false)
 	if err != nil {
 		return nil, err
 	}
@@ -313,13 +330,13 @@ func initTestDNSAccount(t *testing.T, am *DefaultAccountManager) (*types.Account
 		return nil, err
 	}
 
-	account.NameServerGroups[dnsNSGroup1] = &dns.NameServerGroup{
+	account.NameServerGroups[dnsNSGroup1] = &nbdns.NameServerGroup{
 		ID:   dnsNSGroup1,
 		Name: "ns-group-1",
-		NameServers: []dns.NameServer{{
+		NameServers: []nbdns.NameServer{{
 			IP:     netip.MustParseAddr(savedPeer1.IP.String()),
-			NSType: dns.UDPNameServerType,
-			Port:   dns.DefaultDNSPort,
+			NSType: nbdns.UDPNameServerType,
+			Port:   nbdns.DefaultDNSPort,
 		}},
 		Primary: true,
 		Enabled: true,
@@ -334,157 +351,10 @@ func initTestDNSAccount(t *testing.T, am *DefaultAccountManager) (*types.Account
 	return am.Store.GetAccount(context.Background(), account.Id)
 }
 
-func generateTestData(size int) nbdns.Config {
-	config := nbdns.Config{
-		ServiceEnable:    true,
-		CustomZones:      make([]nbdns.CustomZone, size),
-		NameServerGroups: make([]*nbdns.NameServerGroup, size),
-	}
-
-	for i := 0; i < size; i++ {
-		config.CustomZones[i] = nbdns.CustomZone{
-			Domain: fmt.Sprintf("domain%d.com", i),
-			Records: []nbdns.SimpleRecord{
-				{
-					Name:  fmt.Sprintf("record%d", i),
-					Type:  1,
-					Class: "IN",
-					TTL:   3600,
-					RData: "192.168.1.1",
-				},
-			},
-		}
-
-		config.NameServerGroups[i] = &nbdns.NameServerGroup{
-			ID:                   fmt.Sprintf("group%d", i),
-			Primary:              i == 0,
-			Domains:              []string{fmt.Sprintf("domain%d.com", i)},
-			SearchDomainsEnabled: true,
-			NameServers: []nbdns.NameServer{
-				{
-					IP:     netip.MustParseAddr("8.8.8.8"),
-					Port:   53,
-					NSType: 1,
-				},
-			},
-		}
-	}
-
-	return config
-}
-
-func BenchmarkToProtocolDNSConfig(b *testing.B) {
-	sizes := []int{10, 100, 1000}
-
-	for _, size := range sizes {
-		testData := generateTestData(size)
-
-		b.Run(fmt.Sprintf("WithCache-Size%d", size), func(b *testing.B) {
-			cache := &DNSConfigCache{}
-
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				toProtocolDNSConfig(testData, cache)
-			}
-		})
-
-		b.Run(fmt.Sprintf("WithoutCache-Size%d", size), func(b *testing.B) {
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				cache := &DNSConfigCache{}
-				toProtocolDNSConfig(testData, cache)
-			}
-		})
-	}
-}
-
-func TestToProtocolDNSConfigWithCache(t *testing.T) {
-	var cache DNSConfigCache
-
-	// Create two different configs
-	config1 := nbdns.Config{
-		ServiceEnable: true,
-		CustomZones: []nbdns.CustomZone{
-			{
-				Domain: "example.com",
-				Records: []nbdns.SimpleRecord{
-					{Name: "www", Type: 1, Class: "IN", TTL: 300, RData: "192.168.1.1"},
-				},
-			},
-		},
-		NameServerGroups: []*nbdns.NameServerGroup{
-			{
-				ID:   "group1",
-				Name: "Group 1",
-				NameServers: []nbdns.NameServer{
-					{IP: netip.MustParseAddr("8.8.8.8"), Port: 53},
-				},
-			},
-		},
-	}
-
-	config2 := nbdns.Config{
-		ServiceEnable: true,
-		CustomZones: []nbdns.CustomZone{
-			{
-				Domain: "example.org",
-				Records: []nbdns.SimpleRecord{
-					{Name: "mail", Type: 1, Class: "IN", TTL: 300, RData: "192.168.1.2"},
-				},
-			},
-		},
-		NameServerGroups: []*nbdns.NameServerGroup{
-			{
-				ID:   "group2",
-				Name: "Group 2",
-				NameServers: []nbdns.NameServer{
-					{IP: netip.MustParseAddr("8.8.4.4"), Port: 53},
-				},
-			},
-		},
-	}
-
-	// First run with config1
-	result1 := toProtocolDNSConfig(config1, &cache)
-
-	// Second run with config2
-	result2 := toProtocolDNSConfig(config2, &cache)
-
-	// Third run with config1 again
-	result3 := toProtocolDNSConfig(config1, &cache)
-
-	// Verify that result1 and result3 are identical
-	if !reflect.DeepEqual(result1, result3) {
-		t.Errorf("Results are not identical when run with the same input. Expected %v, got %v", result1, result3)
-	}
-
-	// Verify that result2 is different from result1 and result3
-	if reflect.DeepEqual(result1, result2) || reflect.DeepEqual(result2, result3) {
-		t.Errorf("Results should be different for different inputs")
-	}
-
-	// Verify that the cache contains elements from both configs
-	if _, exists := cache.GetCustomZone("example.com"); !exists {
-		t.Errorf("Cache should contain custom zone for example.com")
-	}
-
-	if _, exists := cache.GetCustomZone("example.org"); !exists {
-		t.Errorf("Cache should contain custom zone for example.org")
-	}
-
-	if _, exists := cache.GetNameServerGroup("group1"); !exists {
-		t.Errorf("Cache should contain name server group 'group1'")
-	}
-
-	if _, exists := cache.GetNameServerGroup("group2"); !exists {
-		t.Errorf("Cache should contain name server group 'group2'")
-	}
-}
-
 func TestDNSAccountPeersUpdate(t *testing.T) {
-	manager, account, peer1, peer2, peer3 := setupNetworkMapTest(t)
+	manager, updateManager, account, peer1, peer2, peer3 := setupNetworkMapTest(t)
 
-	err := manager.SaveGroups(context.Background(), account.Id, userID, []*types.Group{
+	err := manager.CreateGroups(context.Background(), account.Id, userID, []*types.Group{
 		{
 			ID:    "groupA",
 			Name:  "GroupA",
@@ -498,9 +368,9 @@ func TestDNSAccountPeersUpdate(t *testing.T) {
 	})
 	assert.NoError(t, err)
 
-	updMsg := manager.peersUpdateManager.CreateChannel(context.Background(), peer1.ID)
+	updMsg := updateManager.CreateChannel(context.Background(), peer1.ID)
 	t.Cleanup(func() {
-		manager.peersUpdateManager.CloseChannel(context.Background(), peer1.ID)
+		updateManager.CloseChannel(context.Background(), peer1.ID)
 	})
 
 	// Saving DNS settings with groups that have no peers should not trigger updates to account peers or send peer updates
@@ -532,10 +402,10 @@ func TestDNSAccountPeersUpdate(t *testing.T) {
 		}()
 
 		_, err = manager.CreateNameServerGroup(
-			context.Background(), account.Id, "ns-group", "ns-group", []dns.NameServer{{
+			context.Background(), account.Id, "ns-group", "ns-group", []nbdns.NameServer{{
 				IP:     netip.MustParseAddr(peer1.IP.String()),
-				NSType: dns.UDPNameServerType,
-				Port:   dns.DefaultDNSPort,
+				NSType: nbdns.UDPNameServerType,
+				Port:   nbdns.DefaultDNSPort,
 			}},
 			[]string{"groupB"},
 			true, []string{}, true, userID, false,
@@ -551,7 +421,7 @@ func TestDNSAccountPeersUpdate(t *testing.T) {
 
 	// Creating DNS settings with groups that have peers should update account peers and send peer update
 	t.Run("creating dns setting with used groups", func(t *testing.T) {
-		err = manager.SaveGroup(context.Background(), account.Id, userID, &types.Group{
+		err = manager.UpdateGroup(context.Background(), account.Id, userID, &types.Group{
 			ID:    "groupA",
 			Name:  "GroupA",
 			Peers: []string{peer1.ID, peer2.ID, peer3.ID},
@@ -565,10 +435,10 @@ func TestDNSAccountPeersUpdate(t *testing.T) {
 		}()
 
 		_, err = manager.CreateNameServerGroup(
-			context.Background(), account.Id, "ns-group-1", "ns-group-1", []dns.NameServer{{
+			context.Background(), account.Id, "ns-group-1", "ns-group-1", []nbdns.NameServer{{
 				IP:     netip.MustParseAddr(peer1.IP.String()),
-				NSType: dns.UDPNameServerType,
-				Port:   dns.DefaultDNSPort,
+				NSType: nbdns.UDPNameServerType,
+				Port:   nbdns.DefaultDNSPort,
 			}},
 			[]string{"groupA"},
 			true, []string{}, true, userID, false,

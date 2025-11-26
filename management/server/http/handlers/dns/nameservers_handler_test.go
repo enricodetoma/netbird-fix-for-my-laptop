@@ -13,12 +13,14 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	nbdns "github.com/netbirdio/netbird/dns"
-	"github.com/netbirdio/netbird/management/server/http/api"
-	"github.com/netbirdio/netbird/management/server/status"
+	"github.com/netbirdio/netbird/shared/management/http/api"
+	"github.com/netbirdio/netbird/shared/management/status"
 
 	"github.com/gorilla/mux"
 
-	"github.com/netbirdio/netbird/management/server/jwtclaims"
+	nbcontext "github.com/netbirdio/netbird/management/server/context"
+	"github.com/netbirdio/netbird/shared/auth"
+
 	"github.com/netbirdio/netbird/management/server/mock_server"
 )
 
@@ -81,19 +83,7 @@ func initNameserversTestData() *nameserversHandler {
 				}
 				return status.Errorf(status.NotFound, "nameserver group with ID %s was not found", nsGroupToSave.ID)
 			},
-			GetAccountIDFromTokenFunc: func(_ context.Context, claims jwtclaims.AuthorizationClaims) (string, string, error) {
-				return claims.AccountId, claims.UserId, nil
-			},
 		},
-		claimsExtractor: jwtclaims.NewClaimsExtractor(
-			jwtclaims.WithFromRequestContext(func(r *http.Request) jwtclaims.AuthorizationClaims {
-				return jwtclaims.AuthorizationClaims{
-					UserId:    "test_user",
-					Domain:    "hotmail.com",
-					AccountId: testNSGroupAccountID,
-				}
-			}),
-		),
 	}
 }
 
@@ -204,6 +194,11 @@ func TestNameserversHandlers(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			req := httptest.NewRequest(tc.requestType, tc.requestPath, tc.requestBody)
+			req = nbcontext.SetUserAuthInRequest(req, auth.UserAuth{
+				UserId:    "test_user",
+				AccountId: testNSGroupAccountID,
+				Domain:    "hotmail.com",
+			})
 
 			router := mux.NewRouter()
 			router.HandleFunc("/api/dns/nameservers/{nsgroupId}", p.getNameserverGroup).Methods("GET")

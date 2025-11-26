@@ -1,25 +1,27 @@
+//go:build !js
+
 package bind
 
 import (
+	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
 	"runtime"
-	"strings"
 	"sync"
 
-	"github.com/pion/stun/v2"
+	"github.com/pion/stun/v3"
 	"github.com/pion/transport/v3"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	wgConn "golang.zx2c4.com/wireguard/conn"
-)
 
-type RecvMessage struct {
-	Endpoint *Endpoint
-	Buffer   []byte
-}
+	"github.com/netbirdio/netbird/client/iface/udpmux"
+	"github.com/netbirdio/netbird/client/iface/wgaddr"
+	nbnet "github.com/netbirdio/netbird/client/net"
+)
 
 type receiverCreator struct {
 	iceBind *ICEBind
@@ -38,32 +40,39 @@ func (rc receiverCreator) CreateIPv4ReceiverFn(pc *ipv4.PacketConn, conn *net.UD
 // use the port because in the Send function the wgConn.Endpoint the port info is not exported.
 type ICEBind struct {
 	*wgConn.StdNetBind
-	RecvChan chan RecvMessage
 
 	transportNet transport.Net
-	filterFn     FilterFn
-	endpoints    map[netip.Addr]net.Conn
-	endpointsMu  sync.Mutex
+	filterFn     udpmux.FilterFn
+	address      wgaddr.Address
+	mtu          uint16
+
+	endpoints   map[netip.Addr]net.Conn
+	endpointsMu sync.Mutex
+	recvChan    chan recvMessage
 	// every time when Close() is called (i.e. BindUpdate()) we need to close exit from the receiveRelayed and create a
 	// new closed channel. With the closedChanMu we can safely close the channel and create a new one
-	closedChan   chan struct{}
-	closedChanMu sync.RWMutex // protect the closeChan recreation from reading from it.
-	closed       bool
+	closedChan       chan struct{}
+	closedChanMu     sync.RWMutex // protect the closeChan recreation from reading from it.
+	closed           bool
+	activityRecorder *ActivityRecorder
 
 	muUDPMux sync.Mutex
-	udpMux   *UniversalUDPMuxDefault
+	udpMux   *udpmux.UniversalUDPMuxDefault
 }
 
-func NewICEBind(transportNet transport.Net, filterFn FilterFn) *ICEBind {
+func NewICEBind(transportNet transport.Net, filterFn udpmux.FilterFn, address wgaddr.Address, mtu uint16) *ICEBind {
 	b, _ := wgConn.NewStdNetBind().(*wgConn.StdNetBind)
 	ib := &ICEBind{
-		StdNetBind:   b,
-		RecvChan:     make(chan RecvMessage, 1),
-		transportNet: transportNet,
-		filterFn:     filterFn,
-		endpoints:    make(map[netip.Addr]net.Conn),
-		closedChan:   make(chan struct{}),
-		closed:       true,
+		StdNetBind:       b,
+		transportNet:     transportNet,
+		filterFn:         filterFn,
+		address:          address,
+		mtu:              mtu,
+		endpoints:        make(map[netip.Addr]net.Conn),
+		recvChan:         make(chan recvMessage, 1),
+		closedChan:       make(chan struct{}),
+		closed:           true,
+		activityRecorder: NewActivityRecorder(),
 	}
 
 	rc := receiverCreator{
@@ -97,8 +106,12 @@ func (s *ICEBind) Close() error {
 	return s.StdNetBind.Close()
 }
 
+func (s *ICEBind) ActivityRecorder() *ActivityRecorder {
+	return s.activityRecorder
+}
+
 // GetICEMux returns the ICE UDPMux that was created and used by ICEBind
-func (s *ICEBind) GetICEMux() (*UniversalUDPMuxDefault, error) {
+func (s *ICEBind) GetICEMux() (*udpmux.UniversalUDPMuxDefault, error) {
 	s.muUDPMux.Lock()
 	defer s.muUDPMux.Unlock()
 	if s.udpMux == nil {
@@ -108,35 +121,27 @@ func (s *ICEBind) GetICEMux() (*UniversalUDPMuxDefault, error) {
 	return s.udpMux, nil
 }
 
-func (b *ICEBind) SetEndpoint(peerAddress *net.UDPAddr, conn net.Conn) (*net.UDPAddr, error) {
-	fakeUDPAddr, err := fakeAddress(peerAddress)
-	if err != nil {
-		return nil, err
-	}
-
-	// force IPv4
-	fakeAddr, ok := netip.AddrFromSlice(fakeUDPAddr.IP.To4())
-	if !ok {
-		return nil, fmt.Errorf("failed to convert IP to netip.Addr")
-	}
-
+func (b *ICEBind) SetEndpoint(fakeIP netip.Addr, conn net.Conn) {
 	b.endpointsMu.Lock()
-	b.endpoints[fakeAddr] = conn
+	b.endpoints[fakeIP] = conn
 	b.endpointsMu.Unlock()
-
-	return fakeUDPAddr, nil
 }
 
-func (b *ICEBind) RemoveEndpoint(fakeUDPAddr *net.UDPAddr) {
-	fakeAddr, ok := netip.AddrFromSlice(fakeUDPAddr.IP.To4())
-	if !ok {
-		log.Warnf("failed to convert IP to netip.Addr")
-		return
-	}
-
+func (b *ICEBind) RemoveEndpoint(fakeIP netip.Addr) {
 	b.endpointsMu.Lock()
 	defer b.endpointsMu.Unlock()
-	delete(b.endpoints, fakeAddr)
+
+	delete(b.endpoints, fakeIP)
+}
+
+func (b *ICEBind) ReceiveFromEndpoint(ctx context.Context, ep *Endpoint, buf []byte) {
+	select {
+	case <-b.closedChan:
+		return
+	case <-ctx.Done():
+		return
+	case b.recvChan <- recvMessage{ep, buf}:
+	}
 }
 
 func (b *ICEBind) Send(bufs [][]byte, ep wgConn.Endpoint) error {
@@ -159,11 +164,13 @@ func (s *ICEBind) createIPv4ReceiverFn(pc *ipv4.PacketConn, conn *net.UDPConn, r
 	s.muUDPMux.Lock()
 	defer s.muUDPMux.Unlock()
 
-	s.udpMux = NewUniversalUDPMuxDefault(
-		UniversalUDPMuxParams{
-			UDPConn:  conn,
-			Net:      s.transportNet,
-			FilterFn: s.filterFn,
+	s.udpMux = udpmux.NewUniversalUDPMuxDefault(
+		udpmux.UniversalUDPMuxParams{
+			UDPConn:   nbnet.WrapPacketConn(conn),
+			Net:       s.transportNet,
+			FilterFn:  s.filterFn,
+			WGAddress: s.address,
+			MTU:       s.mtu,
 		},
 	)
 	return func(bufs [][]byte, sizes []int, eps []wgConn.Endpoint) (n int, err error) {
@@ -213,6 +220,11 @@ func (s *ICEBind) createIPv4ReceiverFn(pc *ipv4.PacketConn, conn *net.UDPConn, r
 				continue
 			}
 			addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
+
+			if isTransportPkg(msg.Buffers, msg.N) {
+				s.activityRecorder.record(addrPort)
+			}
+
 			ep := &wgConn.StdNetEndpoint{AddrPort: addrPort} // TODO: remove allocation
 			wgConn.GetSrcFromControl(msg.OOB[:msg.NN], ep)
 			eps[i] = ep
@@ -264,30 +276,22 @@ func (c *ICEBind) receiveRelayed(buffs [][]byte, sizes []int, eps []wgConn.Endpo
 	select {
 	case <-c.closedChan:
 		return 0, net.ErrClosed
-	case msg, ok := <-c.RecvChan:
+	case msg, ok := <-c.recvChan:
 		if !ok {
 			return 0, net.ErrClosed
 		}
 		copy(buffs[0], msg.Buffer)
 		sizes[0] = len(msg.Buffer)
 		eps[0] = wgConn.Endpoint(msg.Endpoint)
+
+		if isTransportPkg(buffs, sizes[0]) {
+			if ep, ok := eps[0].(*Endpoint); ok {
+				c.activityRecorder.record(ep.AddrPort)
+			}
+		}
+
 		return 1, nil
 	}
-}
-
-// fakeAddress returns a fake address that is used to as an identifier for the peer.
-// The fake address is in the format of 127.1.x.x where x.x is the last two octets of the peer address.
-func fakeAddress(peerAddress *net.UDPAddr) (*net.UDPAddr, error) {
-	octets := strings.Split(peerAddress.IP.String(), ".")
-	if len(octets) != 4 {
-		return nil, fmt.Errorf("invalid IP format")
-	}
-
-	newAddr := &net.UDPAddr{
-		IP:   net.ParseIP(fmt.Sprintf("127.1.%s.%s", octets[2], octets[3])),
-		Port: peerAddress.Port,
-	}
-	return newAddr, nil
 }
 
 func getMessages(msgsPool *sync.Pool) *[]ipv6.Message {
@@ -300,4 +304,20 @@ func putMessages(msgs *[]ipv6.Message, msgsPool *sync.Pool) {
 		(*msgs)[i] = ipv6.Message{Buffers: (*msgs)[i].Buffers, OOB: (*msgs)[i].OOB}
 	}
 	msgsPool.Put(msgs)
+}
+
+func isTransportPkg(buffers [][]byte, n int) bool {
+	// The first buffer should contain at least 4 bytes for type
+	if len(buffers[0]) < 4 {
+		return true
+	}
+
+	// WireGuard packet type is a little-endian uint32 at start
+	packetType := binary.LittleEndian.Uint32(buffers[0][:4])
+
+	// Check if packetType matches known WireGuard message types
+	if packetType == 4 && n > 32 {
+		return true
+	}
+	return false
 }

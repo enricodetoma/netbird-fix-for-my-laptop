@@ -1,11 +1,11 @@
 package nftables
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 
 	"github.com/google/nftables"
@@ -14,22 +14,31 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	firewall "github.com/netbirdio/netbird/client/firewall/manager"
-	"github.com/netbirdio/netbird/client/iface"
+	"github.com/netbirdio/netbird/client/iface/wgaddr"
 	"github.com/netbirdio/netbird/client/internal/statemanager"
 )
 
 const (
-	// tableNameNetbird is the name of the table that is used for filtering by the Netbird client
+	// tableNameNetbird is the default name of the table that is used for filtering by the Netbird client
 	tableNameNetbird = "netbird"
+	// envTableName is the environment variable to override the table name
+	envTableName = "NB_NFTABLES_TABLE"
 
 	tableNameFilter = "filter"
 	chainNameInput  = "INPUT"
 )
 
+func getTableName() string {
+	if name := os.Getenv(envTableName); name != "" {
+		return name
+	}
+	return tableNameNetbird
+}
+
 // iFaceMapper defines subset methods of interface required for manager
 type iFaceMapper interface {
 	Name() string
-	Address() iface.WGAddress
+	Address() wgaddr.Address
 	IsUserspaceBind() bool
 }
 
@@ -44,16 +53,16 @@ type Manager struct {
 }
 
 // Create nftables firewall manager
-func Create(wgIface iFaceMapper) (*Manager, error) {
+func Create(wgIface iFaceMapper, mtu uint16) (*Manager, error) {
 	m := &Manager{
 		rConn:   &nftables.Conn{},
 		wgIface: wgIface,
 	}
 
-	workTable := &nftables.Table{Name: tableNameNetbird, Family: nftables.TableFamilyIPv4}
+	workTable := &nftables.Table{Name: getTableName(), Family: nftables.TableFamilyIPv4}
 
 	var err error
-	m.router, err = newRouter(workTable, wgIface)
+	m.router, err = newRouter(workTable, wgIface, mtu)
 	if err != nil {
 		return nil, fmt.Errorf("create router: %w", err)
 	}
@@ -87,12 +96,13 @@ func (m *Manager) Init(stateManager *statemanager.Manager) error {
 	// We only need to record minimal interface state for potential recreation.
 	// Unlike iptables, which requires tracking individual rules, nftables maintains
 	// a known state (our netbird table plus a few static rules). This allows for easy
-	// cleanup using Reset() without needing to store specific rules.
+	// cleanup using Close() without needing to store specific rules.
 	if err := stateManager.UpdateState(&ShutdownState{
 		InterfaceState: &InterfaceState{
 			NameStr:       m.wgIface.Name(),
 			WGAddress:     m.wgIface.Address(),
 			UserspaceBind: m.wgIface.IsUserspaceBind(),
+			MTU:           m.router.mtu,
 		},
 	}); err != nil {
 		log.Errorf("failed to update state: %v", err)
@@ -113,14 +123,13 @@ func (m *Manager) Init(stateManager *statemanager.Manager) error {
 // If comment argument is empty firewall manager should set
 // rule ID as comment for the rule
 func (m *Manager) AddPeerFiltering(
+	id []byte,
 	ip net.IP,
 	proto firewall.Protocol,
 	sPort *firewall.Port,
 	dPort *firewall.Port,
-	direction firewall.RuleDirection,
 	action firewall.Action,
 	ipsetName string,
-	comment string,
 ) ([]firewall.Rule, error) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
@@ -130,18 +139,25 @@ func (m *Manager) AddPeerFiltering(
 		return nil, fmt.Errorf("unsupported IP version: %s", ip.String())
 	}
 
-	return m.aclManager.AddPeerFiltering(ip, proto, sPort, dPort, direction, action, ipsetName, comment)
+	return m.aclManager.AddPeerFiltering(id, ip, proto, sPort, dPort, action, ipsetName)
 }
 
-func (m *Manager) AddRouteFiltering(sources []netip.Prefix, destination netip.Prefix, proto firewall.Protocol, sPort *firewall.Port, dPort *firewall.Port, action firewall.Action) (firewall.Rule, error) {
+func (m *Manager) AddRouteFiltering(
+	id []byte,
+	sources []netip.Prefix,
+	destination firewall.Network,
+	proto firewall.Protocol,
+	sPort, dPort *firewall.Port,
+	action firewall.Action,
+) (firewall.Rule, error) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	if !destination.Addr().Is4() {
-		return nil, fmt.Errorf("unsupported IP version: %s", destination.Addr().String())
+	if destination.IsPrefix() && !destination.Prefix.Addr().Is4() {
+		return nil, fmt.Errorf("unsupported IP version: %s", destination.Prefix.Addr().String())
 	}
 
-	return m.router.AddRouteFiltering(sources, destination, proto, sPort, dPort, action)
+	return m.router.AddRouteFiltering(id, sources, destination, proto, sPort, dPort, action)
 }
 
 // DeletePeerRule from the firewall by rule definition
@@ -161,6 +177,10 @@ func (m *Manager) DeleteRouteRule(rule firewall.Rule) error {
 }
 
 func (m *Manager) IsServerRouteSupported() bool {
+	return true
+}
+
+func (m *Manager) IsStateful() bool {
 	return true
 }
 
@@ -187,44 +207,11 @@ func (m *Manager) AllowNetbird() error {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	err := m.aclManager.createDefaultAllowRules()
-	if err != nil {
-		return fmt.Errorf("failed to create default allow rules: %v", err)
+	if err := m.aclManager.createDefaultAllowRules(); err != nil {
+		return fmt.Errorf("create default allow rules: %w", err)
 	}
-
-	chains, err := m.rConn.ListChainsOfTableFamily(nftables.TableFamilyIPv4)
-	if err != nil {
-		return fmt.Errorf("list of chains: %w", err)
-	}
-
-	var chain *nftables.Chain
-	for _, c := range chains {
-		if c.Table.Name == tableNameFilter && c.Name == chainNameInput {
-			chain = c
-			break
-		}
-	}
-
-	if chain == nil {
-		log.Debugf("chain INPUT not found. Skipping add allow netbird rule")
-		return nil
-	}
-
-	rules, err := m.rConn.GetRules(chain.Table, chain)
-	if err != nil {
-		return fmt.Errorf("failed to get rules for the INPUT chain: %v", err)
-	}
-
-	if rule := m.detectAllowNetbirdRule(rules); rule != nil {
-		log.Debugf("allow netbird rule already exists: %v", rule)
-		return nil
-	}
-
-	m.applyAllowNetbirdRules(chain)
-
-	err = m.rConn.Flush()
-	if err != nil {
-		return fmt.Errorf("failed to flush allow input netbird rules: %v", err)
+	if err := m.rConn.Flush(); err != nil {
+		return fmt.Errorf("flush allow input netbird rules: %w", err)
 	}
 
 	return nil
@@ -235,14 +222,10 @@ func (m *Manager) SetLegacyManagement(isLegacy bool) error {
 	return firewall.SetLegacyManagement(m.router, isLegacy)
 }
 
-// Reset firewall to the default state
-func (m *Manager) Reset(stateManager *statemanager.Manager) error {
+// Close closes the firewall manager
+func (m *Manager) Close(stateManager *statemanager.Manager) error {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
-
-	if err := m.resetNetbirdInputRules(); err != nil {
-		return fmt.Errorf("reset netbird input rules: %v", err)
-	}
 
 	if err := m.router.Reset(); err != nil {
 		return fmt.Errorf("reset router: %v", err)
@@ -263,51 +246,36 @@ func (m *Manager) Reset(stateManager *statemanager.Manager) error {
 	return nil
 }
 
-func (m *Manager) resetNetbirdInputRules() error {
-	chains, err := m.rConn.ListChains()
-	if err != nil {
-		return fmt.Errorf("list chains: %w", err)
-	}
-
-	m.deleteNetbirdInputRules(chains)
-
-	return nil
-}
-
-func (m *Manager) deleteNetbirdInputRules(chains []*nftables.Chain) {
-	for _, c := range chains {
-		if c.Table.Name == tableNameFilter && c.Name == chainNameInput {
-			rules, err := m.rConn.GetRules(c.Table, c)
-			if err != nil {
-				log.Errorf("get rules for chain %q: %v", c.Name, err)
-				continue
-			}
-
-			m.deleteMatchingRules(rules)
-		}
-	}
-}
-
-func (m *Manager) deleteMatchingRules(rules []*nftables.Rule) {
-	for _, r := range rules {
-		if bytes.Equal(r.UserData, []byte(allowNetbirdInputRuleID)) {
-			if err := m.rConn.DelRule(r); err != nil {
-				log.Errorf("delete rule: %v", err)
-			}
-		}
-	}
-}
-
 func (m *Manager) cleanupNetbirdTables() error {
 	tables, err := m.rConn.ListTables()
 	if err != nil {
 		return fmt.Errorf("list tables: %w", err)
 	}
 
+	tableName := getTableName()
 	for _, t := range tables {
-		if t.Name == tableNameNetbird {
+		if t.Name == tableName {
 			m.rConn.DelTable(t)
 		}
+	}
+	return nil
+}
+
+// SetLogLevel sets the log level for the firewall manager
+func (m *Manager) SetLogLevel(log.Level) {
+	// not supported
+}
+
+func (m *Manager) EnableRouting() error {
+	if err := m.router.ipFwdState.RequestForwarding(); err != nil {
+		return fmt.Errorf("enable IP forwarding: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) DisableRouting() error {
+	if err := m.router.ipFwdState.ReleaseForwarding(); err != nil {
+		return fmt.Errorf("disable IP forwarding: %w", err)
 	}
 	return nil
 }
@@ -323,59 +291,62 @@ func (m *Manager) Flush() error {
 	return m.aclManager.Flush()
 }
 
+// AddDNATRule adds a DNAT rule
+func (m *Manager) AddDNATRule(rule firewall.ForwardRule) (firewall.Rule, error) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	return m.router.AddDNATRule(rule)
+}
+
+// DeleteDNATRule deletes a DNAT rule
+func (m *Manager) DeleteDNATRule(rule firewall.Rule) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	return m.router.DeleteDNATRule(rule)
+}
+
+// UpdateSet updates the set with the given prefixes
+func (m *Manager) UpdateSet(set firewall.Set, prefixes []netip.Prefix) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	return m.router.UpdateSet(set, prefixes)
+}
+
+// AddInboundDNAT adds an inbound DNAT rule redirecting traffic from NetBird peers to local services.
+func (m *Manager) AddInboundDNAT(localAddr netip.Addr, protocol firewall.Protocol, sourcePort, targetPort uint16) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	return m.router.AddInboundDNAT(localAddr, protocol, sourcePort, targetPort)
+}
+
+// RemoveInboundDNAT removes an inbound DNAT rule.
+func (m *Manager) RemoveInboundDNAT(localAddr netip.Addr, protocol firewall.Protocol, sourcePort, targetPort uint16) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	return m.router.RemoveInboundDNAT(localAddr, protocol, sourcePort, targetPort)
+}
+
 func (m *Manager) createWorkTable() (*nftables.Table, error) {
 	tables, err := m.rConn.ListTablesOfFamily(nftables.TableFamilyIPv4)
 	if err != nil {
 		return nil, fmt.Errorf("list of tables: %w", err)
 	}
 
+	tableName := getTableName()
 	for _, t := range tables {
-		if t.Name == tableNameNetbird {
+		if t.Name == tableName {
 			m.rConn.DelTable(t)
 		}
 	}
 
-	table := m.rConn.AddTable(&nftables.Table{Name: tableNameNetbird, Family: nftables.TableFamilyIPv4})
+	table := m.rConn.AddTable(&nftables.Table{Name: getTableName(), Family: nftables.TableFamilyIPv4})
 	err = m.rConn.Flush()
 	return table, err
-}
-
-func (m *Manager) applyAllowNetbirdRules(chain *nftables.Chain) {
-	rule := &nftables.Rule{
-		Table: chain.Table,
-		Chain: chain,
-		Exprs: []expr.Any{
-			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     ifname(m.wgIface.Name()),
-			},
-			&expr.Verdict{
-				Kind: expr.VerdictAccept,
-			},
-		},
-		UserData: []byte(allowNetbirdInputRuleID),
-	}
-	_ = m.rConn.InsertRule(rule)
-}
-
-func (m *Manager) detectAllowNetbirdRule(existedRules []*nftables.Rule) *nftables.Rule {
-	ifName := ifname(m.wgIface.Name())
-	for _, rule := range existedRules {
-		if rule.Table.Name == tableNameFilter && rule.Chain.Name == chainNameInput {
-			if len(rule.Exprs) < 4 {
-				if e, ok := rule.Exprs[0].(*expr.Meta); !ok || e.Key != expr.MetaKeyIIFNAME {
-					continue
-				}
-				if e, ok := rule.Exprs[1].(*expr.Cmp); !ok || e.Op != expr.CmpOpEq || !bytes.Equal(e.Data, ifName) {
-					continue
-				}
-				return rule
-			}
-		}
-	}
-	return nil
 }
 
 func insertReturnTrafficRule(conn *nftables.Conn, table *nftables.Table, chain *nftables.Chain) {

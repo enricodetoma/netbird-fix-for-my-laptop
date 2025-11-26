@@ -1,5 +1,9 @@
 package types
 
+import (
+	"github.com/netbirdio/netbird/shared/management/proto"
+)
+
 // PolicyUpdateOperationType operation type
 type PolicyUpdateOperationType int
 
@@ -16,6 +20,21 @@ type PolicyRuleDirection string
 type RulePortRange struct {
 	Start uint16
 	End   uint16
+}
+
+func (r *RulePortRange) ToProto() *proto.PortInfo {
+	return &proto.PortInfo{
+		PortSelection: &proto.PortInfo_Range_{
+			Range: &proto.PortInfo_Range{
+				Start: uint32(r.Start),
+				End:   uint32(r.End),
+			},
+		},
+	}
+}
+
+func (r *RulePortRange) Equal(other *RulePortRange) bool {
+	return r.Start == other.Start && r.End == other.End
 }
 
 // PolicyRule is the metadata of the policy
@@ -66,18 +85,20 @@ type PolicyRule struct {
 // Copy returns a copy of a policy rule
 func (pm *PolicyRule) Copy() *PolicyRule {
 	rule := &PolicyRule{
-		ID:            pm.ID,
-		PolicyID:      pm.PolicyID,
-		Name:          pm.Name,
-		Description:   pm.Description,
-		Enabled:       pm.Enabled,
-		Action:        pm.Action,
-		Destinations:  make([]string, len(pm.Destinations)),
-		Sources:       make([]string, len(pm.Sources)),
-		Bidirectional: pm.Bidirectional,
-		Protocol:      pm.Protocol,
-		Ports:         make([]string, len(pm.Ports)),
-		PortRanges:    make([]RulePortRange, len(pm.PortRanges)),
+		ID:                  pm.ID,
+		PolicyID:            pm.PolicyID,
+		Name:                pm.Name,
+		Description:         pm.Description,
+		Enabled:             pm.Enabled,
+		Action:              pm.Action,
+		Destinations:        make([]string, len(pm.Destinations)),
+		DestinationResource: pm.DestinationResource,
+		Sources:             make([]string, len(pm.Sources)),
+		SourceResource:      pm.SourceResource,
+		Bidirectional:       pm.Bidirectional,
+		Protocol:            pm.Protocol,
+		Ports:               make([]string, len(pm.Ports)),
+		PortRanges:          make([]RulePortRange, len(pm.PortRanges)),
 	}
 	copy(rule.Destinations, pm.Destinations)
 	copy(rule.Sources, pm.Sources)

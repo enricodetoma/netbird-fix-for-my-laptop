@@ -8,23 +8,25 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/miekg/dns"
+	"github.com/rs/xid"
 	log "github.com/sirupsen/logrus"
 
 	nbdns "github.com/netbirdio/netbird/dns"
-	"github.com/netbirdio/netbird/management/domain"
 	resourceTypes "github.com/netbirdio/netbird/management/server/networks/resources/types"
 	routerTypes "github.com/netbirdio/netbird/management/server/networks/routers/types"
 	networkTypes "github.com/netbirdio/netbird/management/server/networks/types"
 	nbpeer "github.com/netbirdio/netbird/management/server/peer"
 	"github.com/netbirdio/netbird/management/server/posture"
-	"github.com/netbirdio/netbird/management/server/status"
 	"github.com/netbirdio/netbird/management/server/telemetry"
 	"github.com/netbirdio/netbird/management/server/util"
 	"github.com/netbirdio/netbird/route"
+	"github.com/netbirdio/netbird/shared/management/domain"
+	"github.com/netbirdio/netbird/shared/management/status"
 )
 
 const (
@@ -35,9 +37,35 @@ const (
 	PublicCategory  = "public"
 	PrivateCategory = "private"
 	UnknownCategory = "unknown"
+
+	// firewallRuleMinPortRangesVer defines the minimum peer version that supports port range rules.
+	firewallRuleMinPortRangesVer = "0.48.0"
+	// firewallRuleMinNativeSSHVer defines the minimum peer version that supports native SSH features in the firewall rules.
+	firewallRuleMinNativeSSHVer = "0.60.0"
+
+	// nativeSSHPortString defines the default port number as a string used for native SSH connections; this port is used by clients when hijacking ssh connections.
+	nativeSSHPortString = "22022"
+	// defaultSSHPortString defines the standard SSH port number as a string, commonly used for default SSH connections.
+	defaultSSHPortString = "22"
 )
 
+type supportedFeatures struct {
+	nativeSSH  bool
+	portRanges bool
+}
+
 type LookupMap map[string]struct{}
+
+// AccountMeta is a struct that contains a stripped down version of the Account object.
+// It doesn't carry any peers, groups, policies, or routes, etc. Just some metadata (e.g. ID, created by, created at, etc).
+type AccountMeta struct {
+	// AccountId is the unique identifier of the account
+	AccountID      string `gorm:"column:id"`
+	CreatedAt      time.Time
+	CreatedBy      string
+	Domain         string
+	DomainCategory string
+}
 
 // Account represents a unique account of the system
 type Account struct {
@@ -58,7 +86,7 @@ type Account struct {
 	Users                  map[string]*User                  `gorm:"-"`
 	UsersG                 []User                            `json:"-" gorm:"foreignKey:AccountID;references:id"`
 	Groups                 map[string]*Group                 `gorm:"-"`
-	GroupsG                []Group                           `json:"-" gorm:"foreignKey:AccountID;references:id"`
+	GroupsG                []*Group                          `json:"-" gorm:"foreignKey:AccountID;references:id"`
 	Policies               []*Policy                         `gorm:"foreignKey:AccountID;references:id"`
 	Routes                 map[route.ID]*route.Route         `gorm:"-"`
 	RoutesG                []route.Route                     `json:"-" gorm:"foreignKey:AccountID;references:id"`
@@ -67,11 +95,24 @@ type Account struct {
 	DNSSettings            DNSSettings                       `gorm:"embedded;embeddedPrefix:dns_settings_"`
 	PostureChecks          []*posture.Checks                 `gorm:"foreignKey:AccountID;references:id"`
 	// Settings is a dictionary of Account settings
-	Settings *Settings `gorm:"embedded;embeddedPrefix:settings_"`
-
+	Settings         *Settings                        `gorm:"embedded;embeddedPrefix:settings_"`
 	Networks         []*networkTypes.Network          `gorm:"foreignKey:AccountID;references:id"`
 	NetworkRouters   []*routerTypes.NetworkRouter     `gorm:"foreignKey:AccountID;references:id"`
 	NetworkResources []*resourceTypes.NetworkResource `gorm:"foreignKey:AccountID;references:id"`
+	Onboarding       AccountOnboarding                `gorm:"foreignKey:AccountID;references:id;constraint:OnDelete:CASCADE"`
+
+	NetworkMapCache *NetworkMapBuilder `gorm:"-"`
+	nmapInitOnce    *sync.Once         `gorm:"-"`
+}
+
+func (a *Account) InitOnce() {
+	a.nmapInitOnce = &sync.Once{}
+}
+
+// this class is used by gorm only
+type PrimaryAccountInfo struct {
+	IsDomainPrimaryAccount bool
+	Domain                 string
 }
 
 // Subclass used in gorm to only load network and not whole account
@@ -87,6 +128,20 @@ type AccountDNSSettings struct {
 // Subclass used in gorm to only load settings and not whole account
 type AccountSettings struct {
 	Settings *Settings `gorm:"embedded;embeddedPrefix:settings_"`
+}
+
+type AccountOnboarding struct {
+	AccountID             string `gorm:"primaryKey"`
+	OnboardingFlowPending bool
+	SignupFormPending     bool
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+}
+
+// IsEqual compares two AccountOnboarding objects and returns true if they are equal
+func (o AccountOnboarding) IsEqual(onboarding AccountOnboarding) bool {
+	return o.OnboardingFlowPending == onboarding.OnboardingFlowPending &&
+		o.SignupFormPending == onboarding.SignupFormPending
 }
 
 // GetRoutesToSync returns the enabled routes for the peer ID and the routes
@@ -145,11 +200,6 @@ func (a *Account) getRoutingPeerRoutes(ctx context.Context, peerID string) (enab
 	peer := a.GetPeer(peerID)
 	if peer == nil {
 		log.WithContext(ctx).Errorf("peer %s that doesn't exist under account %s", peerID, a.Id)
-		return enabledRoutes, disabledRoutes
-	}
-
-	// currently we support only linux routing peers
-	if peer.Meta.GoOS != "linux" {
 		return enabledRoutes, disabledRoutes
 	}
 
@@ -227,7 +277,6 @@ func (a *Account) GetPeerNetworkMap(
 	metrics *telemetry.AccountManagerMetrics,
 ) *NetworkMap {
 	start := time.Now()
-
 	peer := a.Peers[peerID]
 	if peer == nil {
 		return &NetworkMap{
@@ -241,7 +290,7 @@ func (a *Account) GetPeerNetworkMap(
 		}
 	}
 
-	aclPeers, firewallRules := a.GetPeerConnectionResources(ctx, peerID, validatedPeersMap)
+	aclPeers, firewallRules := a.GetPeerConnectionResources(ctx, peer, validatedPeersMap)
 	// exclude expired peers
 	var peersToConnect []*nbpeer.Peer
 	var expiredPeers []*nbpeer.Peer
@@ -270,9 +319,12 @@ func (a *Account) GetPeerNetworkMap(
 
 	if dnsManagementStatus {
 		var zones []nbdns.CustomZone
-
 		if peersCustomZone.Domain != "" {
-			zones = append(zones, peersCustomZone)
+			records := filterZoneRecordsForPeers(peer, peersCustomZone, peersToConnectIncludingRouters, expiredPeers)
+			zones = append(zones, nbdns.CustomZone{
+				Domain:  peersCustomZone.Domain,
+				Records: records,
+			})
 		}
 		dnsUpdate.CustomZones = zones
 		dnsUpdate.NameServerGroups = getPeerNSGroups(a, peerID)
@@ -289,14 +341,14 @@ func (a *Account) GetPeerNetworkMap(
 	}
 
 	if metrics != nil {
-		objectCount := int64(len(peersToConnect) + len(expiredPeers) + len(routesUpdate) + len(firewallRules))
+		objectCount := int64(len(peersToConnectIncludingRouters) + len(expiredPeers) + len(routesUpdate) + len(networkResourcesRoutes) + len(firewallRules) + +len(networkResourcesFirewallRules) + len(routesFirewallRules))
 		metrics.CountNetworkMapObjects(objectCount)
 		metrics.CountGetPeerNetworkMapDuration(time.Since(start))
 
 		if objectCount > 5000 {
 			log.WithContext(ctx).Tracef("account: %s has a total resource count of %d objects, "+
-				"peers to connect: %d, expired peers: %d, routes: %d, firewall rules: %d",
-				a.Id, objectCount, len(peersToConnect), len(expiredPeers), len(routesUpdate), len(firewallRules))
+				"peers to connect: %d, expired peers: %d, routes: %d, firewall rules: %d, network resources routes: %d, network resources firewall rules: %d, routes firewall rules: %d",
+				a.Id, objectCount, len(peersToConnectIncludingRouters), len(expiredPeers), len(routesUpdate), len(firewallRules), len(networkResourcesRoutes), len(networkResourcesFirewallRules), len(routesFirewallRules))
 		}
 	}
 
@@ -459,8 +511,23 @@ func (a *Account) GetPeersCustomZone(ctx context.Context, dnsDomain string) nbdn
 			TTL:   defaultTTL,
 			RData: peer.IP.String(),
 		})
-
 		sb.Reset()
+
+		for _, extraLabel := range peer.ExtraDNSLabels {
+			sb.Grow(len(extraLabel) + len(domainSuffix))
+			sb.WriteString(extraLabel)
+			sb.WriteString(domainSuffix)
+
+			customZone.Records = append(customZone.Records, nbdns.SimpleRecord{
+				Name:  sb.String(),
+				Type:  int(dns.TypeA),
+				Class: nbdns.DefaultClass,
+				TTL:   defaultTTL,
+				RData: peer.IP.String(),
+			})
+			sb.Reset()
+		}
+
 	}
 
 	go func() {
@@ -841,6 +908,19 @@ func (a *Account) Copy() *Account {
 		Networks:               nets,
 		NetworkRouters:         networkRouters,
 		NetworkResources:       networkResources,
+		Onboarding:             a.Onboarding,
+		NetworkMapCache:        a.NetworkMapCache,
+		nmapInitOnce:           a.nmapInitOnce,
+	}
+}
+
+func (a *Account) GetMeta() *AccountMeta {
+	return &AccountMeta{
+		AccountID:      a.Id,
+		CreatedBy:      a.CreatedBy,
+		CreatedAt:      a.CreatedAt,
+		Domain:         a.Domain,
+		DomainCategory: a.DomainCategory,
 	}
 }
 
@@ -929,8 +1009,9 @@ func (a *Account) UserGroupsRemoveFromPeers(userID string, groups ...string) map
 // GetPeerConnectionResources for a given peer
 //
 // This function returns the list of peers and firewall rules that are applicable to a given peer.
-func (a *Account) GetPeerConnectionResources(ctx context.Context, peerID string, validatedPeersMap map[string]struct{}) ([]*nbpeer.Peer, []*FirewallRule) {
-	generateResources, getAccumulatedResources := a.connResourcesGenerator(ctx)
+func (a *Account) GetPeerConnectionResources(ctx context.Context, peer *nbpeer.Peer, validatedPeersMap map[string]struct{}) ([]*nbpeer.Peer, []*FirewallRule) {
+	generateResources, getAccumulatedResources := a.connResourcesGenerator(ctx, peer)
+
 	for _, policy := range a.Policies {
 		if !policy.Enabled {
 			continue
@@ -941,8 +1022,20 @@ func (a *Account) GetPeerConnectionResources(ctx context.Context, peerID string,
 				continue
 			}
 
-			sourcePeers, peerInSources := a.getAllPeersFromGroups(ctx, rule.Sources, peerID, policy.SourcePostureChecks, validatedPeersMap)
-			destinationPeers, peerInDestinations := a.getAllPeersFromGroups(ctx, rule.Destinations, peerID, nil, validatedPeersMap)
+			var sourcePeers, destinationPeers []*nbpeer.Peer
+			var peerInSources, peerInDestinations bool
+
+			if rule.SourceResource.Type == ResourceTypePeer && rule.SourceResource.ID != "" {
+				sourcePeers, peerInSources = a.getPeerFromResource(rule.SourceResource, peer.ID)
+			} else {
+				sourcePeers, peerInSources = a.getAllPeersFromGroups(ctx, rule.Sources, peer.ID, policy.SourcePostureChecks, validatedPeersMap)
+			}
+
+			if rule.DestinationResource.Type == ResourceTypePeer && rule.DestinationResource.ID != "" {
+				destinationPeers, peerInDestinations = a.getPeerFromResource(rule.DestinationResource, peer.ID)
+			} else {
+				destinationPeers, peerInDestinations = a.getAllPeersFromGroups(ctx, rule.Destinations, peer.ID, nil, validatedPeersMap)
+			}
 
 			if rule.Bidirectional {
 				if peerInSources {
@@ -971,20 +1064,13 @@ func (a *Account) GetPeerConnectionResources(ctx context.Context, peerID string,
 // The generator function is used to generate the list of peers and firewall rules that are applicable to a given peer.
 // It safe to call the generator function multiple times for same peer and different rules no duplicates will be
 // generated. The accumulator function returns the result of all the generator calls.
-func (a *Account) connResourcesGenerator(ctx context.Context) (func(*PolicyRule, []*nbpeer.Peer, int), func() ([]*nbpeer.Peer, []*FirewallRule)) {
+func (a *Account) connResourcesGenerator(ctx context.Context, targetPeer *nbpeer.Peer) (func(*PolicyRule, []*nbpeer.Peer, int), func() ([]*nbpeer.Peer, []*FirewallRule)) {
 	rulesExists := make(map[string]struct{})
 	peersExists := make(map[string]struct{})
 	rules := make([]*FirewallRule, 0)
 	peers := make([]*nbpeer.Peer, 0)
 
-	all, err := a.GetGroupAll()
-	if err != nil {
-		log.WithContext(ctx).Errorf("failed to get group all: %v", err)
-		all = &Group{}
-	}
-
 	return func(rule *PolicyRule, groupPeers []*nbpeer.Peer, direction int) {
-			isAll := (len(all.Peers) - 1) == len(groupPeers)
 			for _, peer := range groupPeers {
 				if peer == nil {
 					continue
@@ -996,14 +1082,11 @@ func (a *Account) connResourcesGenerator(ctx context.Context) (func(*PolicyRule,
 				}
 
 				fr := FirewallRule{
+					PolicyID:  rule.ID,
 					PeerIP:    peer.IP.String(),
 					Direction: direction,
 					Action:    string(rule.Action),
 					Protocol:  string(rule.Protocol),
-				}
-
-				if isAll {
-					fr.PeerIP = "0.0.0.0"
 				}
 
 				ruleID := rule.ID + fr.PeerIP + strconv.Itoa(direction) +
@@ -1013,16 +1096,12 @@ func (a *Account) connResourcesGenerator(ctx context.Context) (func(*PolicyRule,
 				}
 				rulesExists[ruleID] = struct{}{}
 
-				if len(rule.Ports) == 0 {
+				if len(rule.Ports) == 0 && len(rule.PortRanges) == 0 {
 					rules = append(rules, &fr)
 					continue
 				}
 
-				for _, port := range rule.Ports {
-					pr := fr // clone rule and add set new port
-					pr.Port = port
-					rules = append(rules, &pr)
-				}
+				rules = append(rules, expandPortsAndRanges(fr, rule, targetPeer)...)
 			}
 		}, func() ([]*nbpeer.Peer, []*FirewallRule) {
 			return peers, rules
@@ -1065,6 +1144,15 @@ func (a *Account) getAllPeersFromGroups(ctx context.Context, groups []string, pe
 	}
 
 	return filteredPeers, peerInGroups
+}
+
+func (a *Account) getPeerFromResource(resource Resource, peerID string) ([]*nbpeer.Peer, bool) {
+	peer := a.GetPeer(resource.ID)
+	if peer == nil {
+		return []*nbpeer.Peer{}, false
+	}
+
+	return []*nbpeer.Peer{peer}, resource.ID == peerID
 }
 
 // validatePostureChecksOnPeer validates the posture checks on a peer
@@ -1166,6 +1254,13 @@ func (a *Account) getRulePeers(rule *PolicyRule, postureChecks []string, peerID 
 			}
 		}
 	}
+	if rule.SourceResource.Type == ResourceTypePeer && rule.SourceResource.ID != "" {
+		_, distPeer := distributionPeers[rule.SourceResource.ID]
+		_, valid := validatedPeersMap[rule.SourceResource.ID]
+		if distPeer && valid && a.validatePostureChecksOnPeer(context.Background(), postureChecks, rule.SourceResource.ID) {
+			distPeersWithPolicy[rule.SourceResource.ID] = struct{}{}
+		}
+	}
 
 	distributionGroupPeers := make([]*nbpeer.Peer, 0, len(distPeersWithPolicy))
 	for pID := range distPeersWithPolicy {
@@ -1207,6 +1302,7 @@ func getDefaultPermit(route *route.Route) []*RouteFirewallRule {
 		Protocol:     string(PolicyRuleProtocolALL),
 		Domains:      route.Domains,
 		IsDynamic:    route.IsDynamic(),
+		RouteID:      route.ID,
 	}
 
 	rules = append(rules, &rule)
@@ -1255,7 +1351,7 @@ func (a *Account) GetPeerNetworkResourceFirewallRules(ctx context.Context, peer 
 		if route.Peer != peer.Key {
 			continue
 		}
-		resourceAppliedPolicies := resourcePolicies[route.GetResourceID()]
+		resourceAppliedPolicies := resourcePolicies[string(route.GetResourceID())]
 		distributionPeers := getPoliciesSourcePeers(resourceAppliedPolicies, a.Groups)
 
 		rules := a.getRouteFirewallRules(ctx, peer.ID, resourceAppliedPolicies, route, validatedPeersMap, distributionPeers)
@@ -1321,7 +1417,12 @@ func (a *Account) GetNetworkResourcesRoutesToSync(ctx context.Context, peerID st
 
 		addedResourceRoute := false
 		for _, policy := range resourcePolicies[resource.ID] {
-			peers := a.getUniquePeerIDsFromGroupsIDs(ctx, policy.SourceGroups())
+			var peers []string
+			if policy.Rules[0].SourceResource.Type == ResourceTypePeer && policy.Rules[0].SourceResource.ID != "" {
+				peers = []string{policy.Rules[0].SourceResource.ID}
+			} else {
+				peers = a.getUniquePeerIDsFromGroupsIDs(ctx, policy.SourceGroups())
+			}
 			if addSourcePeers {
 				for _, pID := range a.getPostureValidPeers(peers, policy.SourcePostureChecks) {
 					allSourcePeers[pID] = struct{}{}
@@ -1505,8 +1606,171 @@ func getPoliciesSourcePeers(policies []*Policy, groups map[string]*Group) map[st
 					sourcePeers[peer] = struct{}{}
 				}
 			}
+
+			if rule.SourceResource.Type == ResourceTypePeer && rule.SourceResource.ID != "" {
+				sourcePeers[rule.SourceResource.ID] = struct{}{}
+			}
 		}
 	}
 
 	return sourcePeers
+}
+
+// AddAllGroup to account object if it doesn't exist
+func (a *Account) AddAllGroup(disableDefaultPolicy bool) error {
+	if len(a.Groups) == 0 {
+		allGroup := &Group{
+			ID:     xid.New().String(),
+			Name:   "All",
+			Issued: GroupIssuedAPI,
+		}
+		for _, peer := range a.Peers {
+			allGroup.Peers = append(allGroup.Peers, peer.ID)
+		}
+		a.Groups = map[string]*Group{allGroup.ID: allGroup}
+
+		if disableDefaultPolicy {
+			return nil
+		}
+
+		id := xid.New().String()
+
+		defaultPolicy := &Policy{
+			ID:          id,
+			Name:        DefaultRuleName,
+			Description: DefaultRuleDescription,
+			Enabled:     true,
+			Rules: []*PolicyRule{
+				{
+					ID:            id,
+					Name:          DefaultRuleName,
+					Description:   DefaultRuleDescription,
+					Enabled:       true,
+					Sources:       []string{allGroup.ID},
+					Destinations:  []string{allGroup.ID},
+					Bidirectional: true,
+					Protocol:      PolicyRuleProtocolALL,
+					Action:        PolicyTrafficActionAccept,
+				},
+			},
+		}
+
+		a.Policies = []*Policy{defaultPolicy}
+	}
+	return nil
+}
+
+// expandPortsAndRanges expands Ports and PortRanges of a rule into individual firewall rules
+func expandPortsAndRanges(base FirewallRule, rule *PolicyRule, peer *nbpeer.Peer) []*FirewallRule {
+	features := peerSupportedFirewallFeatures(peer.Meta.WtVersion)
+
+	var expanded []*FirewallRule
+
+	for _, port := range rule.Ports {
+		fr := base
+		fr.Port = port
+		expanded = append(expanded, &fr)
+	}
+
+	for _, portRange := range rule.PortRanges {
+		// prefer PolicyRule.Ports
+		if len(rule.Ports) > 0 {
+			break
+		}
+		fr := base
+
+		if features.portRanges {
+			fr.PortRange = portRange
+		} else {
+			// Peer doesn't support port ranges, only allow single-port ranges
+			if portRange.Start != portRange.End {
+				continue
+			}
+			fr.Port = strconv.FormatUint(uint64(portRange.Start), 10)
+		}
+		expanded = append(expanded, &fr)
+	}
+
+	if shouldCheckRulesForNativeSSH(features.nativeSSH, rule, peer) {
+		expanded = addNativeSSHRule(base, expanded)
+	}
+
+	return expanded
+}
+
+// addNativeSSHRule adds a native SSH rule (port 22022) to the expanded rules if the base rule has port 22 configured.
+func addNativeSSHRule(base FirewallRule, expanded []*FirewallRule) []*FirewallRule {
+	shouldAdd := false
+	for _, fr := range expanded {
+		if isPortInRule(nativeSSHPortString, 22022, fr) {
+			return expanded
+		}
+		if isPortInRule(defaultSSHPortString, 22, fr) {
+			shouldAdd = true
+		}
+	}
+	if !shouldAdd {
+		return expanded
+	}
+
+	fr := base
+	fr.Port = nativeSSHPortString
+	return append(expanded, &fr)
+}
+
+func isPortInRule(portString string, portInt uint16, rule *FirewallRule) bool {
+	return rule.Port == portString || (rule.PortRange.Start <= portInt && portInt <= rule.PortRange.End)
+}
+
+// shouldCheckRulesForNativeSSH determines whether specific policy rules should be checked for native SSH support.
+// While users can add the nativeSSHPortString, we look for cases when they used port 22 and based on SSH enabled
+// in both management and client, we indicate to add the native port.
+func shouldCheckRulesForNativeSSH(supportsNative bool, rule *PolicyRule, peer *nbpeer.Peer) bool {
+	return supportsNative && peer.SSHEnabled && peer.Meta.Flags.ServerSSHAllowed && rule.Protocol == PolicyRuleProtocolTCP
+}
+
+// peerSupportedFirewallFeatures checks if the peer version supports port ranges.
+func peerSupportedFirewallFeatures(peerVer string) supportedFeatures {
+	if strings.Contains(peerVer, "dev") {
+		return supportedFeatures{true, true}
+	}
+
+	var features supportedFeatures
+
+	meetMinVer, err := posture.MeetsMinVersion(firewallRuleMinNativeSSHVer, peerVer)
+	features.nativeSSH = err == nil && meetMinVer
+
+	if features.nativeSSH {
+		features.portRanges = true
+	} else {
+		meetMinVer, err = posture.MeetsMinVersion(firewallRuleMinPortRangesVer, peerVer)
+		features.portRanges = err == nil && meetMinVer
+	}
+
+	return features
+}
+
+// filterZoneRecordsForPeers filters DNS records to only include peers to connect.
+func filterZoneRecordsForPeers(peer *nbpeer.Peer, customZone nbdns.CustomZone, peersToConnect, expiredPeers []*nbpeer.Peer) []nbdns.SimpleRecord {
+	filteredRecords := make([]nbdns.SimpleRecord, 0, len(customZone.Records))
+	peerIPs := make(map[string]struct{})
+
+	// Add peer's own IP to include its own DNS records
+	peerIPs[peer.IP.String()] = struct{}{}
+
+	for _, peerToConnect := range peersToConnect {
+		peerIPs[peerToConnect.IP.String()] = struct{}{}
+	}
+
+	for _, expiredPeer := range expiredPeers {
+		peerIPs[expiredPeer.IP.String()] = struct{}{}
+	}
+
+	for _, record := range customZone.Records {
+		if _, exists := peerIPs[record.RData]; exists {
+			filteredRecords = append(filteredRecords, record)
+		}
+	}
+
+	return filteredRecords
 }

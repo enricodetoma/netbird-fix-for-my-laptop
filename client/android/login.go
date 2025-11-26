@@ -13,6 +13,7 @@ import (
 	"github.com/netbirdio/netbird/client/cmd"
 	"github.com/netbirdio/netbird/client/internal"
 	"github.com/netbirdio/netbird/client/internal/auth"
+	"github.com/netbirdio/netbird/client/internal/profilemanager"
 	"github.com/netbirdio/netbird/client/system"
 )
 
@@ -31,23 +32,24 @@ type ErrListener interface {
 // URLOpener it is a callback interface. The Open function will be triggered if
 // the backend want to show an url for the user
 type URLOpener interface {
-	Open(string)
+	Open(url string, userCode string)
+	OnLoginSuccess()
 }
 
 // Auth can register or login new client
 type Auth struct {
 	ctx     context.Context
-	config  *internal.Config
+	config  *profilemanager.Config
 	cfgPath string
 }
 
 // NewAuth instantiate Auth struct and validate the management URL
 func NewAuth(cfgPath string, mgmURL string) (*Auth, error) {
-	inputCfg := internal.ConfigInput{
+	inputCfg := profilemanager.ConfigInput{
 		ManagementURL: mgmURL,
 	}
 
-	cfg, err := internal.CreateInMemoryConfig(inputCfg)
+	cfg, err := profilemanager.CreateInMemoryConfig(inputCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +62,7 @@ func NewAuth(cfgPath string, mgmURL string) (*Auth, error) {
 }
 
 // NewAuthWithConfig instantiate Auth based on existing config
-func NewAuthWithConfig(ctx context.Context, config *internal.Config) *Auth {
+func NewAuthWithConfig(ctx context.Context, config *profilemanager.Config) *Auth {
 	return &Auth{
 		ctx:    ctx,
 		config: config,
@@ -110,7 +112,7 @@ func (a *Auth) saveConfigIfSSOSupported() (bool, error) {
 		return false, fmt.Errorf("backoff cycle failed: %v", err)
 	}
 
-	err = internal.WriteOutConfig(a.cfgPath, a.config)
+	err = profilemanager.WriteOutConfig(a.cfgPath, a.config)
 	return true, err
 }
 
@@ -142,13 +144,13 @@ func (a *Auth) loginWithSetupKeyAndSaveConfig(setupKey string, deviceName string
 		return fmt.Errorf("backoff cycle failed: %v", err)
 	}
 
-	return internal.WriteOutConfig(a.cfgPath, a.config)
+	return profilemanager.WriteOutConfig(a.cfgPath, a.config)
 }
 
 // Login try register the client on the server
-func (a *Auth) Login(resultListener ErrListener, urlOpener URLOpener) {
+func (a *Auth) Login(resultListener ErrListener, urlOpener URLOpener, isAndroidTV bool) {
 	go func() {
-		err := a.login(urlOpener)
+		err := a.login(urlOpener, isAndroidTV)
 		if err != nil {
 			resultListener.OnError(err)
 		} else {
@@ -157,12 +159,12 @@ func (a *Auth) Login(resultListener ErrListener, urlOpener URLOpener) {
 	}()
 }
 
-func (a *Auth) login(urlOpener URLOpener) error {
+func (a *Auth) login(urlOpener URLOpener, isAndroidTV bool) error {
 	var needsLogin bool
 
 	// check if we need to generate JWT token
 	err := a.withBackOff(a.ctx, func() (err error) {
-		needsLogin, err = internal.IsLoginRequired(a.ctx, a.config.PrivateKey, a.config.ManagementURL, a.config.SSHKey)
+		needsLogin, err = internal.IsLoginRequired(a.ctx, a.config)
 		return
 	})
 	if err != nil {
@@ -171,7 +173,7 @@ func (a *Auth) login(urlOpener URLOpener) error {
 
 	jwtToken := ""
 	if needsLogin {
-		tokenInfo, err := a.foregroundGetTokenInfo(urlOpener)
+		tokenInfo, err := a.foregroundGetTokenInfo(urlOpener, isAndroidTV)
 		if err != nil {
 			return fmt.Errorf("interactive sso login failed: %v", err)
 		}
@@ -180,6 +182,11 @@ func (a *Auth) login(urlOpener URLOpener) error {
 
 	err = a.withBackOff(a.ctx, func() error {
 		err := internal.Login(a.ctx, a.config, "", jwtToken)
+
+		if err == nil {
+			go urlOpener.OnLoginSuccess()
+		}
+
 		if s, ok := gstatus.FromError(err); ok && (s.Code() == codes.InvalidArgument || s.Code() == codes.PermissionDenied) {
 			return nil
 		}
@@ -192,8 +199,8 @@ func (a *Auth) login(urlOpener URLOpener) error {
 	return nil
 }
 
-func (a *Auth) foregroundGetTokenInfo(urlOpener URLOpener) (*auth.TokenInfo, error) {
-	oAuthFlow, err := auth.NewOAuthFlow(a.ctx, a.config, false)
+func (a *Auth) foregroundGetTokenInfo(urlOpener URLOpener, isAndroidTV bool) (*auth.TokenInfo, error) {
+	oAuthFlow, err := auth.NewOAuthFlow(a.ctx, a.config, false, isAndroidTV, "")
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +210,7 @@ func (a *Auth) foregroundGetTokenInfo(urlOpener URLOpener) (*auth.TokenInfo, err
 		return nil, fmt.Errorf("getting a request OAuth flow info failed: %v", err)
 	}
 
-	go urlOpener.Open(flowInfo.VerificationURIComplete)
+	go urlOpener.Open(flowInfo.VerificationURIComplete, flowInfo.UserCode)
 
 	waitTimeout := time.Duration(flowInfo.ExpiresIn) * time.Second
 	waitCTX, cancel := context.WithTimeout(a.ctx, waitTimeout)

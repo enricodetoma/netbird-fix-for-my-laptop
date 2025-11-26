@@ -1,6 +1,7 @@
 package iface
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
@@ -9,13 +10,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/pion/transport/v3/stdnet"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/netbirdio/netbird/client/iface/device"
+	"github.com/netbirdio/netbird/client/internal/stdnet"
 )
 
 // keep darwin compatibility
@@ -40,7 +41,7 @@ func TestWGIface_UpdateAddr(t *testing.T) {
 	ifaceName := fmt.Sprintf("utun%d", WgIntNumber+4)
 	addr := "100.64.0.1/8"
 	wgPort := 33100
-	newNet, err := stdnet.NewNet()
+	newNet, err := stdnet.NewNet(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +124,7 @@ func getIfaceAddrs(ifaceName string) ([]net.Addr, error) {
 func Test_CreateInterface(t *testing.T) {
 	ifaceName := fmt.Sprintf("utun%d", WgIntNumber+1)
 	wgIP := "10.99.99.1/32"
-	newNet, err := stdnet.NewNet()
+	newNet, err := stdnet.NewNet(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +167,7 @@ func Test_Close(t *testing.T) {
 	ifaceName := fmt.Sprintf("utun%d", WgIntNumber+2)
 	wgIP := "10.99.99.2/32"
 	wgPort := 33100
-	newNet, err := stdnet.NewNet()
+	newNet, err := stdnet.NewNet(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +212,7 @@ func TestRecreation(t *testing.T) {
 			ifaceName := fmt.Sprintf("utun%d", WgIntNumber+2)
 			wgIP := "10.99.99.2/32"
 			wgPort := 33100
-			newNet, err := stdnet.NewNet()
+			newNet, err := stdnet.NewNet(context.Background(), nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -284,7 +285,7 @@ func Test_ConfigureInterface(t *testing.T) {
 	ifaceName := fmt.Sprintf("utun%d", WgIntNumber+3)
 	wgIP := "10.99.99.5/30"
 	wgPort := 33100
-	newNet, err := stdnet.NewNet()
+	newNet, err := stdnet.NewNet(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +340,7 @@ func Test_ConfigureInterface(t *testing.T) {
 func Test_UpdatePeer(t *testing.T) {
 	ifaceName := fmt.Sprintf("utun%d", WgIntNumber+4)
 	wgIP := "10.99.99.9/30"
-	newNet, err := stdnet.NewNet()
+	newNet, err := stdnet.NewNet(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,12 +374,12 @@ func Test_UpdatePeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	keepAlive := 15 * time.Second
-	allowedIP := "10.99.99.10/32"
+	allowedIP := netip.MustParsePrefix("10.99.99.10/32")
 	endpoint, err := net.ResolveUDPAddr("udp", "127.0.0.1:9900")
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = iface.UpdatePeer(peerPubKey, allowedIP, keepAlive, endpoint, nil)
+	err = iface.UpdatePeer(peerPubKey, []netip.Prefix{allowedIP}, keepAlive, endpoint, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +397,7 @@ func Test_UpdatePeer(t *testing.T) {
 
 	var foundAllowedIP bool
 	for _, aip := range peer.AllowedIPs {
-		if aip.String() == allowedIP {
+		if aip.String() == allowedIP.String() {
 			foundAllowedIP = true
 			break
 		}
@@ -409,7 +410,7 @@ func Test_UpdatePeer(t *testing.T) {
 func Test_RemovePeer(t *testing.T) {
 	ifaceName := fmt.Sprintf("utun%d", WgIntNumber+4)
 	wgIP := "10.99.99.13/30"
-	newNet, err := stdnet.NewNet()
+	newNet, err := stdnet.NewNet(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,9 +444,8 @@ func Test_RemovePeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	keepAlive := 15 * time.Second
-	allowedIP := "10.99.99.14/32"
-
-	err = iface.UpdatePeer(peerPubKey, allowedIP, keepAlive, nil, nil)
+	allowedIP := netip.MustParsePrefix("10.99.99.14/32")
+	err = iface.UpdatePeer(peerPubKey, []netip.Prefix{allowedIP}, keepAlive, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,17 +462,17 @@ func Test_RemovePeer(t *testing.T) {
 
 func Test_ConnectPeers(t *testing.T) {
 	peer1ifaceName := fmt.Sprintf("utun%d", WgIntNumber+400)
-	peer1wgIP := "10.99.99.17/30"
+	peer1wgIP := netip.MustParsePrefix("10.99.99.17/30")
 	peer1Key, _ := wgtypes.GeneratePrivateKey()
 	peer1wgPort := 33100
 
 	peer2ifaceName := "utun500"
-	peer2wgIP := "10.99.99.18/30"
+	peer2wgIP := netip.MustParsePrefix("10.99.99.18/30")
 	peer2Key, _ := wgtypes.GeneratePrivateKey()
 	peer2wgPort := 33200
 
 	keepAlive := 1 * time.Second
-	newNet, err := stdnet.NewNet()
+	newNet, err := stdnet.NewNet(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,7 +482,7 @@ func Test_ConnectPeers(t *testing.T) {
 
 	optsPeer1 := WGIFaceOpts{
 		IFaceName:    peer1ifaceName,
-		Address:      peer1wgIP,
+		Address:      peer1wgIP.String(),
 		WGPort:       peer1wgPort,
 		WGPrivKey:    peer1Key.String(),
 		MTU:          DefaultMTU,
@@ -515,14 +515,14 @@ func Test_ConnectPeers(t *testing.T) {
 	guid = fmt.Sprintf("{%s}", uuid.New().String())
 	device.CustomWindowsGUIDString = strings.ToLower(guid)
 
-	newNet, err = stdnet.NewNet()
+	newNet, err = stdnet.NewNet(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	optsPeer2 := WGIFaceOpts{
 		IFaceName:    peer2ifaceName,
-		Address:      peer2wgIP,
+		Address:      peer2wgIP.String(),
 		WGPort:       peer2wgPort,
 		WGPrivKey:    peer2Key.String(),
 		MTU:          DefaultMTU,
@@ -558,11 +558,11 @@ func Test_ConnectPeers(t *testing.T) {
 		}
 	}()
 
-	err = iface1.UpdatePeer(peer2Key.PublicKey().String(), peer2wgIP, keepAlive, peer2endpoint, nil)
+	err = iface1.UpdatePeer(peer2Key.PublicKey().String(), []netip.Prefix{peer2wgIP}, keepAlive, peer2endpoint, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = iface2.UpdatePeer(peer1Key.PublicKey().String(), peer1wgIP, keepAlive, peer1endpoint, nil)
+	err = iface2.UpdatePeer(peer1Key.PublicKey().String(), []netip.Prefix{peer1wgIP}, keepAlive, peer1endpoint, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10,31 +10,36 @@ import (
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
+	"golang.zx2c4.com/wireguard/tun/netstack"
 
 	"github.com/netbirdio/netbird/client/iface/bind"
 	"github.com/netbirdio/netbird/client/iface/configurer"
+	"github.com/netbirdio/netbird/client/iface/udpmux"
+	"github.com/netbirdio/netbird/client/iface/wgaddr"
 )
 
 type TunDevice struct {
 	name    string
-	address WGAddress
+	address wgaddr.Address
 	port    int
 	key     string
+	mtu     uint16
 	iceBind *bind.ICEBind
 	tunFd   int
 
 	device         *device.Device
 	filteredDevice *FilteredDevice
-	udpMux         *bind.UniversalUDPMuxDefault
+	udpMux         *udpmux.UniversalUDPMuxDefault
 	configurer     WGConfigurer
 }
 
-func NewTunDevice(name string, address WGAddress, port int, key string, iceBind *bind.ICEBind, tunFd int) *TunDevice {
+func NewTunDevice(name string, address wgaddr.Address, port int, key string, mtu uint16, iceBind *bind.ICEBind, tunFd int) *TunDevice {
 	return &TunDevice{
 		name:    name,
 		address: address,
 		port:    port,
 		key:     key,
+		mtu:     mtu,
 		iceBind: iceBind,
 		tunFd:   tunFd,
 	}
@@ -64,12 +69,12 @@ func (t *TunDevice) Create() (WGConfigurer, error) {
 
 	t.filteredDevice = newDeviceFilter(tunDevice)
 	log.Debug("Attaching to interface")
-	t.device = device.NewDevice(t.filteredDevice, t.iceBind, device.NewLogger(wgLogLevel(), "[wiretrustee] "))
+	t.device = device.NewDevice(t.filteredDevice, t.iceBind, device.NewLogger(wgLogLevel(), "[netbird] "))
 	// without this property mobile devices can discover remote endpoints if the configured one was wrong.
 	// this helps with support for the older NetBird clients that had a hardcoded direct mode
 	// t.device.DisableSomeRoamingForBrokenMobileSemantics()
 
-	t.configurer = configurer.NewUSPConfigurer(t.device, t.name)
+	t.configurer = configurer.NewUSPConfigurer(t.device, t.name, t.iceBind.ActivityRecorder())
 	err = t.configurer.ConfigureInterface(t.key, t.port)
 	if err != nil {
 		t.device.Close()
@@ -79,7 +84,7 @@ func (t *TunDevice) Create() (WGConfigurer, error) {
 	return t.configurer, nil
 }
 
-func (t *TunDevice) Up() (*bind.UniversalUDPMuxDefault, error) {
+func (t *TunDevice) Up() (*udpmux.UniversalUDPMuxDefault, error) {
 	err := t.device.Up()
 	if err != nil {
 		return nil, err
@@ -119,15 +124,28 @@ func (t *TunDevice) Close() error {
 	return nil
 }
 
-func (t *TunDevice) WgAddress() WGAddress {
+func (t *TunDevice) WgAddress() wgaddr.Address {
 	return t.address
 }
 
-func (t *TunDevice) UpdateAddr(addr WGAddress) error {
+func (t *TunDevice) MTU() uint16 {
+	return t.mtu
+}
+
+func (t *TunDevice) UpdateAddr(_ wgaddr.Address) error {
 	// todo implement
 	return nil
 }
 
 func (t *TunDevice) FilteredDevice() *FilteredDevice {
 	return t.filteredDevice
+}
+
+func (t *TunDevice) GetNet() *netstack.Net {
+	return nil
+}
+
+// GetICEBind returns the ICEBind instance
+func (t *TunDevice) GetICEBind() EndpointManager {
+	return t.iceBind
 }

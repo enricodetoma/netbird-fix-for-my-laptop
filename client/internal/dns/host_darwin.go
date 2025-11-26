@@ -7,12 +7,13 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"net"
+	"net/netip"
 	"os/exec"
 	"strconv"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/exp/maps"
 
 	"github.com/netbirdio/netbird/client/internal/statemanager"
 )
@@ -28,6 +29,7 @@ const (
 	arraySymbol                         = "* "
 	digitSymbol                         = "# "
 	scutilPath                          = "/usr/sbin/scutil"
+	dscacheutilPath                     = "/usr/bin/dscacheutil"
 	searchSuffix                        = "Search"
 	matchSuffix                         = "Match"
 	localSuffix                         = "Local"
@@ -49,28 +51,21 @@ func (s *systemConfigurator) supportCustomPort() bool {
 }
 
 func (s *systemConfigurator) applyDNSConfig(config HostDNSConfig, stateManager *statemanager.Manager) error {
-	var err error
-
-	if err := stateManager.UpdateState(&ShutdownState{}); err != nil {
-		log.Errorf("failed to update shutdown state: %s", err)
-	}
-
 	var (
 		searchDomains []string
 		matchDomains  []string
 	)
 
-	err = s.recordSystemDNSSettings(true)
-	if err != nil {
+	if err := s.recordSystemDNSSettings(true); err != nil {
 		log.Errorf("unable to update record of System's DNS config: %s", err.Error())
 	}
 
 	if config.RouteAll {
 		searchDomains = append(searchDomains, "\"\"")
-		err = s.addLocalDNS()
-		if err != nil {
-			log.Infof("failed to enable split DNS")
+		if err := s.addLocalDNS(); err != nil {
+			log.Warnf("failed to add local DNS: %v", err)
 		}
+		s.updateState(stateManager)
 	}
 
 	for _, dConf := range config.Domains {
@@ -78,13 +73,14 @@ func (s *systemConfigurator) applyDNSConfig(config HostDNSConfig, stateManager *
 			continue
 		}
 		if dConf.MatchOnly {
-			matchDomains = append(matchDomains, dConf.Domain)
+			matchDomains = append(matchDomains, strings.TrimSuffix(dConf.Domain, "."))
 			continue
 		}
-		searchDomains = append(searchDomains, dConf.Domain)
+		searchDomains = append(searchDomains, strings.TrimSuffix(""+dConf.Domain, "."))
 	}
 
 	matchKey := getKeyWithInput(netbirdDNSStateKeyFormat, matchSuffix)
+	var err error
 	if len(matchDomains) != 0 {
 		err = s.addMatchDomains(matchKey, strings.Join(matchDomains, " "), config.ServerIP, config.ServerPort)
 	} else {
@@ -94,6 +90,7 @@ func (s *systemConfigurator) applyDNSConfig(config HostDNSConfig, stateManager *
 	if err != nil {
 		return fmt.Errorf("add match domains: %w", err)
 	}
+	s.updateState(stateManager)
 
 	searchKey := getKeyWithInput(netbirdDNSStateKeyFormat, searchSuffix)
 	if len(searchDomains) != 0 {
@@ -105,8 +102,23 @@ func (s *systemConfigurator) applyDNSConfig(config HostDNSConfig, stateManager *
 	if err != nil {
 		return fmt.Errorf("add search domains: %w", err)
 	}
+	s.updateState(stateManager)
+
+	if err := s.flushDNSCache(); err != nil {
+		log.Errorf("failed to flush DNS cache: %v", err)
+	}
 
 	return nil
+}
+
+func (s *systemConfigurator) updateState(stateManager *statemanager.Manager) {
+	if err := stateManager.UpdateState(&ShutdownState{CreatedKeys: maps.Keys(s.createdKeys)}); err != nil {
+		log.Errorf("failed to update shutdown state: %s", err)
+	}
+}
+
+func (s *systemConfigurator) string() string {
+	return "scutil"
 }
 
 func (s *systemConfigurator) restoreHostDNS() error {
@@ -121,6 +133,10 @@ func (s *systemConfigurator) restoreHostDNS() error {
 		if err != nil {
 			log.Errorf("failed to remove %s domains from system: %s", keyType, err)
 		}
+	}
+
+	if err := s.flushDNSCache(); err != nil {
+		log.Errorf("failed to flush DNS cache: %v", err)
 	}
 
 	return nil
@@ -152,26 +168,29 @@ func (s *systemConfigurator) removeKeyFromSystemConfig(key string) error {
 }
 
 func (s *systemConfigurator) addLocalDNS() error {
-	if s.systemDNSSettings.ServerIP == "" || len(s.systemDNSSettings.Domains) == 0 {
-		err := s.recordSystemDNSSettings(true)
-		log.Errorf("Unable to get system DNS configuration")
-		return err
+	if !s.systemDNSSettings.ServerIP.IsValid() || len(s.systemDNSSettings.Domains) == 0 {
+		if err := s.recordSystemDNSSettings(true); err != nil {
+			return fmt.Errorf("recordSystemDNSSettings(): %w", err)
+		}
 	}
 	localKey := getKeyWithInput(netbirdDNSStateKeyFormat, localSuffix)
-	if s.systemDNSSettings.ServerIP != "" && len(s.systemDNSSettings.Domains) != 0 {
-		err := s.addSearchDomains(localKey, strings.Join(s.systemDNSSettings.Domains, " "), s.systemDNSSettings.ServerIP, s.systemDNSSettings.ServerPort)
-		if err != nil {
-			return fmt.Errorf("couldn't add local network DNS conf: %w", err)
-		}
-	} else {
+	if !s.systemDNSSettings.ServerIP.IsValid() || len(s.systemDNSSettings.Domains) == 0 {
 		log.Info("Not enabling local DNS server")
+		return nil
+	}
+
+	if err := s.addSearchDomains(
+		localKey,
+		strings.Join(s.systemDNSSettings.Domains, " "), s.systemDNSSettings.ServerIP, s.systemDNSSettings.ServerPort,
+	); err != nil {
+		return fmt.Errorf("add search domains: %w", err)
 	}
 
 	return nil
 }
 
 func (s *systemConfigurator) recordSystemDNSSettings(force bool) error {
-	if s.systemDNSSettings.ServerIP != "" && len(s.systemDNSSettings.Domains) != 0 && !force {
+	if s.systemDNSSettings.ServerIP.IsValid() && len(s.systemDNSSettings.Domains) != 0 && !force {
 		return nil
 	}
 
@@ -225,8 +244,8 @@ func (s *systemConfigurator) getSystemDNSSettings() (SystemDNSSettings, error) {
 			dnsSettings.Domains = append(dnsSettings.Domains, searchDomain)
 		} else if inServerAddressesArray {
 			address := strings.Split(line, " : ")[1]
-			if ip := net.ParseIP(address); ip != nil && ip.To4() != nil {
-				dnsSettings.ServerIP = address
+			if ip, err := netip.ParseAddr(address); err == nil && ip.Is4() {
+				dnsSettings.ServerIP = ip.Unmap()
 				inServerAddressesArray = false // Stop reading after finding the first IPv4 address
 			}
 		}
@@ -237,12 +256,12 @@ func (s *systemConfigurator) getSystemDNSSettings() (SystemDNSSettings, error) {
 	}
 
 	// default to 53 port
-	dnsSettings.ServerPort = 53
+	dnsSettings.ServerPort = DefaultPort
 
 	return dnsSettings, nil
 }
 
-func (s *systemConfigurator) addSearchDomains(key, domains string, ip string, port int) error {
+func (s *systemConfigurator) addSearchDomains(key, domains string, ip netip.Addr, port int) error {
 	err := s.addDNSState(key, domains, ip, port, true)
 	if err != nil {
 		return fmt.Errorf("add dns state: %w", err)
@@ -255,7 +274,7 @@ func (s *systemConfigurator) addSearchDomains(key, domains string, ip string, po
 	return nil
 }
 
-func (s *systemConfigurator) addMatchDomains(key, domains, dnsServer string, port int) error {
+func (s *systemConfigurator) addMatchDomains(key, domains string, dnsServer netip.Addr, port int) error {
 	err := s.addDNSState(key, domains, dnsServer, port, false)
 	if err != nil {
 		return fmt.Errorf("add dns state: %w", err)
@@ -268,14 +287,14 @@ func (s *systemConfigurator) addMatchDomains(key, domains, dnsServer string, por
 	return nil
 }
 
-func (s *systemConfigurator) addDNSState(state, domains, dnsServer string, port int, enableSearch bool) error {
+func (s *systemConfigurator) addDNSState(state, domains string, dnsServer netip.Addr, port int, enableSearch bool) error {
 	noSearch := "1"
 	if enableSearch {
 		noSearch = "0"
 	}
 	lines := buildAddCommandLine(keySupplementalMatchDomains, arraySymbol+domains)
 	lines += buildAddCommandLine(keySupplementalMatchDomainsNoSearch, digitSymbol+noSearch)
-	lines += buildAddCommandLine(keyServerAddresses, arraySymbol+dnsServer)
+	lines += buildAddCommandLine(keyServerAddresses, arraySymbol+dnsServer.String())
 	lines += buildAddCommandLine(keyServerPort, digitSymbol+strconv.Itoa(port))
 
 	addDomainCommand := buildCreateStateWithOperation(state, lines)
@@ -314,6 +333,21 @@ func (s *systemConfigurator) getPrimaryService() (string, string, error) {
 	}
 
 	return primaryService, router, nil
+}
+
+func (s *systemConfigurator) flushDNSCache() error {
+	cmd := exec.Command(dscacheutilPath, "-flushcache")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("flush DNS cache: %w, output: %s", err, out)
+	}
+
+	cmd = exec.Command("killall", "-HUP", "mDNSResponder")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("restart mDNSResponder: %w, output: %s", err, out)
+	}
+
+	log.Info("flushed DNS cache")
+	return nil
 }
 
 func (s *systemConfigurator) restoreUncleanShutdownDNS() error {

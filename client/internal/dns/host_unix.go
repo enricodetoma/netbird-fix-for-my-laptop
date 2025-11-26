@@ -42,17 +42,23 @@ func (t osManagerType) String() string {
 
 type restoreHostManager interface {
 	hostManager
-	restoreUncleanShutdownDNS(*netip.Addr) error
+	restoreUncleanShutdownDNS(netip.Addr) error
 }
 
 func newHostManager(wgInterface string) (hostManager, error) {
 	osManager, err := getOSDNSManagerType()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get os dns manager type: %w", err)
 	}
 
 	log.Infof("System DNS manager discovered: %s", osManager)
-	return newHostManagerFromType(wgInterface, osManager)
+	mgr, err := newHostManagerFromType(wgInterface, osManager)
+	// need to explicitly return nil mgr on error to avoid returning a non-nil interface containing a nil value
+	if err != nil {
+		return nil, fmt.Errorf("create host manager: %w", err)
+	}
+
+	return mgr, nil
 }
 
 func newHostManagerFromType(wgInterface string, osManager osManagerType) (restoreHostManager, error) {
@@ -124,8 +130,9 @@ func checkStub() bool {
 		return true
 	}
 
+	systemdResolvedAddr := netip.AddrFrom4([4]byte{127, 0, 0, 53}) // 127.0.0.53
 	for _, ns := range rConf.nameServers {
-		if ns == "127.0.0.53" {
+		if ns == systemdResolvedAddr {
 			return true
 		}
 	}

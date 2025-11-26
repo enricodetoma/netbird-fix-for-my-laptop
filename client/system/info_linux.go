@@ -23,6 +23,10 @@ var (
 	getSystemInfo = defaultSysInfoImplementation
 )
 
+func UpdateStaticInfoAsync() {
+	go updateStaticInfo()
+}
+
 // GetInfo retrieves and parses the system information
 func GetInfo(ctx context.Context) *Info {
 	info := _getInfo()
@@ -48,7 +52,7 @@ func GetInfo(ctx context.Context) *Info {
 	}
 
 	start := time.Now()
-	si := updateStaticInfo()
+	si := getStaticInfo()
 	if time.Since(start) > 1*time.Second {
 		log.Warnf("updateStaticInfo took %s", time.Since(start))
 	}
@@ -61,7 +65,7 @@ func GetInfo(ctx context.Context) *Info {
 		Hostname:           extractDeviceName(ctx, systemHostname),
 		GoOS:               runtime.GOOS,
 		CPUs:               runtime.NumCPU(),
-		WiretrusteeVersion: version.NetbirdVersion(),
+		NetbirdVersion:     version.NetbirdVersion(),
 		UIVersion:          extractUserAgent(ctx),
 		KernelVersion:      osInfo[1],
 		NetworkAddresses:   addrs,

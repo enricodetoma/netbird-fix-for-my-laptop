@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/netbirdio/netbird/management/server/util"
+	"github.com/netbirdio/netbird/shared/management/http/api"
 )
 
 // Peer represents a machine connected to the network.
@@ -20,14 +21,14 @@ type Peer struct {
 	// WireGuard public key
 	Key string `gorm:"index"`
 	// IP address of the Peer
-	IP net.IP `gorm:"serializer:json"`
+	IP net.IP `gorm:"serializer:json"` // uniqueness index per accountID (check migrations)
 	// Meta is a Peer system meta data
 	Meta PeerSystemMeta `gorm:"embedded;embeddedPrefix:meta_"`
 	// Name is peer's name (machine name)
-	Name string
+	Name string `gorm:"index"`
 	// DNSLabel is the parsed peer name for domain resolution. It is used to form an FQDN by appending the account's
 	// domain to the peer label. e.g. peer-dns-label.netbird.cloud
-	DNSLabel string
+	DNSLabel string // uniqueness index per accountID (check migrations)
 	// Status peer's management connection status
 	Status *PeerStatus `gorm:"embedded;embeddedPrefix:peer_status_"`
 	// The user ID that registered the peer
@@ -46,9 +47,14 @@ type Peer struct {
 	// CreatedAt records the time the peer was created
 	CreatedAt time.Time
 	// Indicate ephemeral peer attribute
-	Ephemeral bool
+	Ephemeral bool `gorm:"index"`
 	// Geo location based on connection IP
 	Location Location `gorm:"embedded;embeddedPrefix:location_"`
+
+	// ExtraDNSLabels is a list of additional DNS labels that can be used to resolve the peer
+	ExtraDNSLabels []string `gorm:"serializer:json"`
+	// AllowExtraDNSLabels indicates whether the peer allows extra DNS labels to be used for resolving the peer
+	AllowExtraDNSLabels bool
 }
 
 type PeerStatus struct { //nolint:revive
@@ -89,6 +95,22 @@ type File struct {
 	ProcessIsRunning bool
 }
 
+// Flags defines a set of options to control feature behavior
+type Flags struct {
+	RosenpassEnabled    bool
+	RosenpassPermissive bool
+	ServerSSHAllowed    bool
+
+	DisableClientRoutes bool
+	DisableServerRoutes bool
+	DisableDNS          bool
+	DisableFirewall     bool
+	BlockLANAccess      bool
+	BlockInbound        bool
+
+	LazyConnectionEnabled bool
+}
+
 // PeerSystemMeta is a metadata of a Peer machine system
 type PeerSystemMeta struct { //nolint:revive
 	Hostname           string
@@ -106,6 +128,7 @@ type PeerSystemMeta struct { //nolint:revive
 	SystemProductName  string
 	SystemManufacturer string
 	Environment        Environment `gorm:"serializer:json"`
+	Flags              Flags       `gorm:"serializer:json"`
 	Files              []File      `gorm:"serializer:json"`
 }
 
@@ -150,7 +173,8 @@ func (p PeerSystemMeta) isEqual(other PeerSystemMeta) bool {
 		p.SystemProductName == other.SystemProductName &&
 		p.SystemManufacturer == other.SystemManufacturer &&
 		p.Environment.Cloud == other.Environment.Cloud &&
-		p.Environment.Platform == other.Environment.Platform
+		p.Environment.Platform == other.Environment.Platform &&
+		p.Flags.isEqual(other.Flags)
 }
 
 func (p PeerSystemMeta) isEmpty() bool {
@@ -202,15 +226,19 @@ func (p *Peer) Copy() *Peer {
 		Ephemeral:                   p.Ephemeral,
 		Location:                    p.Location,
 		InactivityExpirationEnabled: p.InactivityExpirationEnabled,
+		ExtraDNSLabels:              slices.Clone(p.ExtraDNSLabels),
+		AllowExtraDNSLabels:         p.AllowExtraDNSLabels,
 	}
 }
 
 // UpdateMetaIfNew updates peer's system metadata if new information is provided
 // returns true if meta was updated, false otherwise
-func (p *Peer) UpdateMetaIfNew(meta PeerSystemMeta) bool {
+func (p *Peer) UpdateMetaIfNew(meta PeerSystemMeta) (updated, versionChanged bool) {
 	if meta.isEmpty() {
-		return false
+		return updated, versionChanged
 	}
+
+	versionChanged = p.Meta.WtVersion != meta.WtVersion
 
 	// Avoid overwriting UIVersion if the update was triggered sole by the CLI client
 	if meta.UIVersion == "" {
@@ -218,10 +246,11 @@ func (p *Peer) UpdateMetaIfNew(meta PeerSystemMeta) bool {
 	}
 
 	if p.Meta.isEqual(meta) {
-		return false
+		return updated, versionChanged
 	}
 	p.Meta = meta
-	return true
+	updated = true
+	return updated, versionChanged
 }
 
 // GetLastLogin returns the last login time of the peer.
@@ -307,4 +336,28 @@ func (p *Peer) UpdateLastLogin() *Peer {
 	newStatus.LoginExpired = false
 	p.Status = newStatus
 	return p
+}
+
+func (p *Peer) FromAPITemporaryAccessRequest(a *api.PeerTemporaryAccessRequest) {
+	p.Ephemeral = true
+	p.Name = a.Name
+	p.Key = a.WgPubKey
+	p.Meta = PeerSystemMeta{
+		Hostname: a.Name,
+		GoOS:     "js",
+		OS:       "js",
+	}
+}
+
+func (f Flags) isEqual(other Flags) bool {
+	return f.RosenpassEnabled == other.RosenpassEnabled &&
+		f.RosenpassPermissive == other.RosenpassPermissive &&
+		f.ServerSSHAllowed == other.ServerSSHAllowed &&
+		f.DisableClientRoutes == other.DisableClientRoutes &&
+		f.DisableServerRoutes == other.DisableServerRoutes &&
+		f.DisableDNS == other.DisableDNS &&
+		f.DisableFirewall == other.DisableFirewall &&
+		f.BlockLANAccess == other.BlockLANAccess &&
+		f.BlockInbound == other.BlockInbound &&
+		f.LazyConnectionEnabled == other.LazyConnectionEnabled
 }

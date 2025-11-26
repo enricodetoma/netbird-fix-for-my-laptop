@@ -6,10 +6,10 @@ import (
 	"net/netip"
 	"strings"
 
+	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/metadata"
 
-	"github.com/netbirdio/netbird/management/proto"
-	"github.com/netbirdio/netbird/version"
+	"github.com/netbirdio/netbird/shared/management/proto"
 )
 
 // DeviceNameCtxKey context key for device name
@@ -50,7 +50,7 @@ type Info struct {
 	OSVersion          string
 	Hostname           string
 	CPUs               int
-	WiretrusteeVersion string
+	NetbirdVersion     string
 	UIVersion          string
 	KernelVersion      string
 	NetworkAddresses   []NetworkAddress
@@ -59,14 +59,65 @@ type Info struct {
 	SystemManufacturer string
 	Environment        Environment
 	Files              []File // for posture checks
+
+	RosenpassEnabled    bool
+	RosenpassPermissive bool
+	ServerSSHAllowed    bool
+
+	DisableClientRoutes bool
+	DisableServerRoutes bool
+	DisableDNS          bool
+	DisableFirewall     bool
+	BlockLANAccess      bool
+	BlockInbound        bool
+
+	LazyConnectionEnabled bool
+
+	EnableSSHRoot                 bool
+	EnableSSHSFTP                 bool
+	EnableSSHLocalPortForwarding  bool
+	EnableSSHRemotePortForwarding bool
+	DisableSSHAuth                bool
 }
 
-// StaticInfo is an object that contains machine information that does not change
-type StaticInfo struct {
-	SystemSerialNumber string
-	SystemProductName  string
-	SystemManufacturer string
-	Environment        Environment
+func (i *Info) SetFlags(
+	rosenpassEnabled, rosenpassPermissive bool,
+	serverSSHAllowed *bool,
+	disableClientRoutes, disableServerRoutes,
+	disableDNS, disableFirewall, blockLANAccess, blockInbound, lazyConnectionEnabled bool,
+	enableSSHRoot, enableSSHSFTP, enableSSHLocalPortForwarding, enableSSHRemotePortForwarding *bool,
+	disableSSHAuth *bool,
+) {
+	i.RosenpassEnabled = rosenpassEnabled
+	i.RosenpassPermissive = rosenpassPermissive
+	if serverSSHAllowed != nil {
+		i.ServerSSHAllowed = *serverSSHAllowed
+	}
+
+	i.DisableClientRoutes = disableClientRoutes
+	i.DisableServerRoutes = disableServerRoutes
+	i.DisableDNS = disableDNS
+	i.DisableFirewall = disableFirewall
+	i.BlockLANAccess = blockLANAccess
+	i.BlockInbound = blockInbound
+
+	i.LazyConnectionEnabled = lazyConnectionEnabled
+
+	if enableSSHRoot != nil {
+		i.EnableSSHRoot = *enableSSHRoot
+	}
+	if enableSSHSFTP != nil {
+		i.EnableSSHSFTP = *enableSSHSFTP
+	}
+	if enableSSHLocalPortForwarding != nil {
+		i.EnableSSHLocalPortForwarding = *enableSSHLocalPortForwarding
+	}
+	if enableSSHRemotePortForwarding != nil {
+		i.EnableSSHRemotePortForwarding = *enableSSHRemotePortForwarding
+	}
+	if disableSSHAuth != nil {
+		i.DisableSSHAuth = *disableSSHAuth
+	}
 }
 
 // extractUserAgent extracts Netbird's agent (client) name and version from the outgoing context
@@ -92,11 +143,6 @@ func extractDeviceName(ctx context.Context, defaultName string) string {
 		return defaultName
 	}
 	return v
-}
-
-// GetDesktopUIUserAgent returns the Desktop ui user agent
-func GetDesktopUIUserAgent() string {
-	return "netbird-desktop-ui/" + version.NetbirdVersion()
 }
 
 func networkAddresses() ([]NetworkAddress, error) {
@@ -151,6 +197,7 @@ func isDuplicated(addresses []NetworkAddress, addr NetworkAddress) bool {
 
 // GetInfoWithChecks retrieves and parses the system information with applied checks.
 func GetInfoWithChecks(ctx context.Context, checks []*proto.Checks) (*Info, error) {
+	log.Debugf("gathering system information with checks: %d", len(checks))
 	processCheckPaths := make([]string, 0)
 	for _, check := range checks {
 		processCheckPaths = append(processCheckPaths, check.GetFiles()...)
@@ -160,9 +207,11 @@ func GetInfoWithChecks(ctx context.Context, checks []*proto.Checks) (*Info, erro
 	if err != nil {
 		return nil, err
 	}
+	log.Debugf("gathering process check information completed")
 
 	info := GetInfo(ctx)
 	info.Files = files
 
+	log.Debugf("all system information gathered successfully")
 	return info, nil
 }

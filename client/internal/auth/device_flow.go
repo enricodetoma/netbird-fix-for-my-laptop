@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +13,10 @@ import (
 	"strings"
 	"time"
 
+	log "github.com/sirupsen/logrus"
+
 	"github.com/netbirdio/netbird/client/internal"
+	"github.com/netbirdio/netbird/util/embeddedroots"
 )
 
 // HostedGrantType grant type for device flow on Hosted
@@ -55,6 +60,18 @@ type TokenRequestResponse struct {
 func NewDeviceAuthorizationFlow(config internal.DeviceAuthProviderConfig) (*DeviceAuthorizationFlow, error) {
 	httpTransport := http.DefaultTransport.(*http.Transport).Clone()
 	httpTransport.MaxIdleConns = 5
+
+	certPool, err := x509.SystemCertPool()
+	if err != nil || certPool == nil {
+		log.Debugf("System cert pool not available; falling back to embedded cert, error: %v", err)
+		certPool = embeddedroots.Get()
+	} else {
+		log.Debug("Using system certificate pool.")
+	}
+
+	httpTransport.TLSClientConfig = &tls.Config{
+		RootCAs: certPool,
+	}
 
 	httpClient := &http.Client{
 		Timeout:   10 * time.Second,
@@ -111,7 +128,32 @@ func (d *DeviceAuthorizationFlow) RequestAuthInfo(ctx context.Context) (AuthFlow
 		deviceCode.VerificationURIComplete = deviceCode.VerificationURI
 	}
 
+	if d.providerConfig.LoginHint != "" {
+		deviceCode.VerificationURIComplete = appendLoginHint(deviceCode.VerificationURIComplete, d.providerConfig.LoginHint)
+		if deviceCode.VerificationURI != "" {
+			deviceCode.VerificationURI = appendLoginHint(deviceCode.VerificationURI, d.providerConfig.LoginHint)
+		}
+	}
+
 	return deviceCode, err
+}
+
+func appendLoginHint(uri, loginHint string) string {
+	if uri == "" || loginHint == "" {
+		return uri
+	}
+
+	parsedURL, err := url.Parse(uri)
+	if err != nil {
+		log.Debugf("failed to parse verification URI for login_hint: %v", err)
+		return uri
+	}
+
+	query := parsedURL.Query()
+	query.Set("login_hint", loginHint)
+	parsedURL.RawQuery = query.Encode()
+
+	return parsedURL.String()
 }
 
 func (d *DeviceAuthorizationFlow) requestToken(info AuthFlowInfo) (TokenRequestResponse, error) {

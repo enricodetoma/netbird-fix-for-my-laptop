@@ -6,13 +6,15 @@ import (
 
 	"github.com/gorilla/mux"
 
-	"github.com/netbirdio/netbird/management/server"
+	"github.com/netbirdio/netbird/management/server/account"
+	nbcontext "github.com/netbirdio/netbird/management/server/context"
 	"github.com/netbirdio/netbird/management/server/geolocation"
-	"github.com/netbirdio/netbird/management/server/http/api"
-	"github.com/netbirdio/netbird/management/server/http/configs"
-	"github.com/netbirdio/netbird/management/server/http/util"
-	"github.com/netbirdio/netbird/management/server/jwtclaims"
-	"github.com/netbirdio/netbird/management/server/status"
+	"github.com/netbirdio/netbird/management/server/permissions"
+	"github.com/netbirdio/netbird/management/server/permissions/modules"
+	"github.com/netbirdio/netbird/management/server/permissions/operations"
+	"github.com/netbirdio/netbird/shared/management/http/api"
+	"github.com/netbirdio/netbird/shared/management/http/util"
+	"github.com/netbirdio/netbird/shared/management/status"
 )
 
 var (
@@ -21,26 +23,23 @@ var (
 
 // geolocationsHandler is a handler that returns locations.
 type geolocationsHandler struct {
-	accountManager     server.AccountManager
+	accountManager     account.Manager
 	geolocationManager geolocation.Geolocation
-	claimsExtractor    *jwtclaims.ClaimsExtractor
+	permissionsManager permissions.Manager
 }
 
-func addLocationsEndpoint(accountManager server.AccountManager, locationManager geolocation.Geolocation, authCfg configs.AuthCfg, router *mux.Router) {
-	locationHandler := newGeolocationsHandlerHandler(accountManager, locationManager, authCfg)
+func AddLocationsEndpoints(accountManager account.Manager, locationManager geolocation.Geolocation, permissionsManager permissions.Manager, router *mux.Router) {
+	locationHandler := newGeolocationsHandlerHandler(accountManager, locationManager, permissionsManager)
 	router.HandleFunc("/locations/countries", locationHandler.getAllCountries).Methods("GET", "OPTIONS")
 	router.HandleFunc("/locations/countries/{country}/cities", locationHandler.getCitiesByCountry).Methods("GET", "OPTIONS")
 }
 
 // newGeolocationsHandlerHandler creates a new Geolocations handler
-func newGeolocationsHandlerHandler(accountManager server.AccountManager, geolocationManager geolocation.Geolocation, authCfg configs.AuthCfg) *geolocationsHandler {
+func newGeolocationsHandlerHandler(accountManager account.Manager, geolocationManager geolocation.Geolocation, permissionsManager permissions.Manager) *geolocationsHandler {
 	return &geolocationsHandler{
 		accountManager:     accountManager,
 		geolocationManager: geolocationManager,
-		claimsExtractor: jwtclaims.NewClaimsExtractor(
-			jwtclaims.WithAudience(authCfg.Audience),
-			jwtclaims.WithUserIDClaim(authCfg.UserIDClaim),
-		),
+		permissionsManager: permissionsManager,
 	}
 }
 
@@ -104,19 +103,22 @@ func (l *geolocationsHandler) getCitiesByCountry(w http.ResponseWriter, r *http.
 }
 
 func (l *geolocationsHandler) authenticateUser(r *http.Request) error {
-	claims := l.claimsExtractor.FromRequestContext(r)
-	_, userID, err := l.accountManager.GetAccountIDFromToken(r.Context(), claims)
+	ctx := r.Context()
+
+	userAuth, err := nbcontext.GetUserAuthFromContext(ctx)
 	if err != nil {
 		return err
 	}
 
-	user, err := l.accountManager.GetUserByID(r.Context(), userID)
+	accountID, userID := userAuth.AccountId, userAuth.UserId
+
+	allowed, err := l.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Policies, operations.Read)
 	if err != nil {
-		return err
+		return status.NewPermissionValidationError(err)
 	}
 
-	if !user.HasAdminPower() {
-		return status.Errorf(status.PermissionDenied, "user is not allowed to perform this action")
+	if !allowed {
+		return status.NewPermissionDeniedError()
 	}
 	return nil
 }

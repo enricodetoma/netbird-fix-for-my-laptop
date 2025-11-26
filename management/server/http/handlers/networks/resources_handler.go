@@ -1,30 +1,26 @@
 package networks
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 
 	"github.com/gorilla/mux"
 
+	nbcontext "github.com/netbirdio/netbird/management/server/context"
 	"github.com/netbirdio/netbird/management/server/groups"
-	"github.com/netbirdio/netbird/management/server/http/api"
-	"github.com/netbirdio/netbird/management/server/http/configs"
-	"github.com/netbirdio/netbird/management/server/http/util"
-	"github.com/netbirdio/netbird/management/server/jwtclaims"
 	"github.com/netbirdio/netbird/management/server/networks/resources"
 	"github.com/netbirdio/netbird/management/server/networks/resources/types"
+	"github.com/netbirdio/netbird/shared/management/http/api"
+	"github.com/netbirdio/netbird/shared/management/http/util"
 )
 
 type resourceHandler struct {
-	resourceManager  resources.Manager
-	groupsManager    groups.Manager
-	extractFromToken func(ctx context.Context, claims jwtclaims.AuthorizationClaims) (string, string, error)
-	claimsExtractor  *jwtclaims.ClaimsExtractor
+	resourceManager resources.Manager
+	groupsManager   groups.Manager
 }
 
-func addResourceEndpoints(resourcesManager resources.Manager, groupsManager groups.Manager, extractFromToken func(ctx context.Context, claims jwtclaims.AuthorizationClaims) (string, string, error), authCfg configs.AuthCfg, router *mux.Router) {
-	resourceHandler := newResourceHandler(resourcesManager, groupsManager, extractFromToken, authCfg)
+func addResourceEndpoints(resourcesManager resources.Manager, groupsManager groups.Manager, router *mux.Router) {
+	resourceHandler := newResourceHandler(resourcesManager, groupsManager)
 	router.HandleFunc("/networks/resources", resourceHandler.getAllResourcesInAccount).Methods("GET", "OPTIONS")
 	router.HandleFunc("/networks/{networkId}/resources", resourceHandler.getAllResourcesInNetwork).Methods("GET", "OPTIONS")
 	router.HandleFunc("/networks/{networkId}/resources", resourceHandler.createResource).Methods("POST", "OPTIONS")
@@ -33,26 +29,21 @@ func addResourceEndpoints(resourcesManager resources.Manager, groupsManager grou
 	router.HandleFunc("/networks/{networkId}/resources/{resourceId}", resourceHandler.deleteResource).Methods("DELETE", "OPTIONS")
 }
 
-func newResourceHandler(resourceManager resources.Manager, groupsManager groups.Manager, extractFromToken func(ctx context.Context, claims jwtclaims.AuthorizationClaims) (string, string, error), authCfg configs.AuthCfg) *resourceHandler {
+func newResourceHandler(resourceManager resources.Manager, groupsManager groups.Manager) *resourceHandler {
 	return &resourceHandler{
-		resourceManager:  resourceManager,
-		groupsManager:    groupsManager,
-		extractFromToken: extractFromToken,
-		claimsExtractor: jwtclaims.NewClaimsExtractor(
-			jwtclaims.WithAudience(authCfg.Audience),
-			jwtclaims.WithUserIDClaim(authCfg.UserIDClaim),
-		),
+		resourceManager: resourceManager,
+		groupsManager:   groupsManager,
 	}
 }
 
 func (h *resourceHandler) getAllResourcesInNetwork(w http.ResponseWriter, r *http.Request) {
-	claims := h.claimsExtractor.FromRequestContext(r)
-	accountID, userID, err := h.extractFromToken(r.Context(), claims)
+	userAuth, err := nbcontext.GetUserAuthFromContext(r.Context())
 	if err != nil {
 		util.WriteError(r.Context(), err, w)
 		return
 	}
 
+	accountID, userID := userAuth.AccountId, userAuth.UserId
 	networkID := mux.Vars(r)["networkId"]
 	resources, err := h.resourceManager.GetAllResourcesInNetwork(r.Context(), accountID, userID, networkID)
 	if err != nil {
@@ -66,21 +57,23 @@ func (h *resourceHandler) getAllResourcesInNetwork(w http.ResponseWriter, r *htt
 		return
 	}
 
+	grpsInfoMap := groups.ToGroupsInfoMap(grps, len(resources))
+
 	var resourcesResponse []*api.NetworkResource
 	for _, resource := range resources {
-		groupMinimumInfo := groups.ToGroupsInfo(grps, resource.ID)
-		resourcesResponse = append(resourcesResponse, resource.ToAPIResponse(groupMinimumInfo))
+		resourcesResponse = append(resourcesResponse, resource.ToAPIResponse(grpsInfoMap[resource.ID]))
 	}
 
 	util.WriteJSONObject(r.Context(), w, resourcesResponse)
 }
 func (h *resourceHandler) getAllResourcesInAccount(w http.ResponseWriter, r *http.Request) {
-	claims := h.claimsExtractor.FromRequestContext(r)
-	accountID, userID, err := h.extractFromToken(r.Context(), claims)
+	userAuth, err := nbcontext.GetUserAuthFromContext(r.Context())
 	if err != nil {
 		util.WriteError(r.Context(), err, w)
 		return
 	}
+
+	accountID, userID := userAuth.AccountId, userAuth.UserId
 
 	resources, err := h.resourceManager.GetAllResourcesInAccount(r.Context(), accountID, userID)
 	if err != nil {
@@ -94,22 +87,24 @@ func (h *resourceHandler) getAllResourcesInAccount(w http.ResponseWriter, r *htt
 		return
 	}
 
-	var resourcesResponse []*api.NetworkResource
+	grpsInfoMap := groups.ToGroupsInfoMap(grps, 0)
+
+	resourcesResponse := make([]*api.NetworkResource, 0, len(resources))
 	for _, resource := range resources {
-		groupMinimumInfo := groups.ToGroupsInfo(grps, resource.ID)
-		resourcesResponse = append(resourcesResponse, resource.ToAPIResponse(groupMinimumInfo))
+		resourcesResponse = append(resourcesResponse, resource.ToAPIResponse(grpsInfoMap[resource.ID]))
 	}
 
 	util.WriteJSONObject(r.Context(), w, resourcesResponse)
 }
 
 func (h *resourceHandler) createResource(w http.ResponseWriter, r *http.Request) {
-	claims := h.claimsExtractor.FromRequestContext(r)
-	accountID, userID, err := h.extractFromToken(r.Context(), claims)
+	userAuth, err := nbcontext.GetUserAuthFromContext(r.Context())
 	if err != nil {
 		util.WriteError(r.Context(), err, w)
 		return
 	}
+
+	accountID, userID := userAuth.AccountId, userAuth.UserId
 
 	var req api.NetworkResourceRequest
 	err = json.NewDecoder(r.Body).Decode(&req)
@@ -135,18 +130,19 @@ func (h *resourceHandler) createResource(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	groupMinimumInfo := groups.ToGroupsInfo(grps, resource.ID)
-	util.WriteJSONObject(r.Context(), w, resource.ToAPIResponse(groupMinimumInfo))
+	grpsInfoMap := groups.ToGroupsInfoMap(grps, 0)
+
+	util.WriteJSONObject(r.Context(), w, resource.ToAPIResponse(grpsInfoMap[resource.ID]))
 }
 
 func (h *resourceHandler) getResource(w http.ResponseWriter, r *http.Request) {
-	claims := h.claimsExtractor.FromRequestContext(r)
-	accountID, userID, err := h.extractFromToken(r.Context(), claims)
+	userAuth, err := nbcontext.GetUserAuthFromContext(r.Context())
 	if err != nil {
 		util.WriteError(r.Context(), err, w)
 		return
 	}
 
+	accountID, userID := userAuth.AccountId, userAuth.UserId
 	networkID := mux.Vars(r)["networkId"]
 	resourceID := mux.Vars(r)["resourceId"]
 	resource, err := h.resourceManager.GetResource(r.Context(), accountID, userID, networkID, resourceID)
@@ -161,18 +157,19 @@ func (h *resourceHandler) getResource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	groupMinimumInfo := groups.ToGroupsInfo(grps, resource.ID)
-	util.WriteJSONObject(r.Context(), w, resource.ToAPIResponse(groupMinimumInfo))
+	grpsInfoMap := groups.ToGroupsInfoMap(grps, 0)
+
+	util.WriteJSONObject(r.Context(), w, resource.ToAPIResponse(grpsInfoMap[resource.ID]))
 }
 
 func (h *resourceHandler) updateResource(w http.ResponseWriter, r *http.Request) {
-	claims := h.claimsExtractor.FromRequestContext(r)
-	accountID, userID, err := h.extractFromToken(r.Context(), claims)
+	userAuth, err := nbcontext.GetUserAuthFromContext(r.Context())
 	if err != nil {
 		util.WriteError(r.Context(), err, w)
 		return
 	}
 
+	accountID, userID := userAuth.AccountId, userAuth.UserId
 	var req api.NetworkResourceRequest
 	err = json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
@@ -198,17 +195,18 @@ func (h *resourceHandler) updateResource(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	groupMinimumInfo := groups.ToGroupsInfo(grps, resource.ID)
-	util.WriteJSONObject(r.Context(), w, resource.ToAPIResponse(groupMinimumInfo))
+	grpsInfoMap := groups.ToGroupsInfoMap(grps, 0)
+
+	util.WriteJSONObject(r.Context(), w, resource.ToAPIResponse(grpsInfoMap[resource.ID]))
 }
 
 func (h *resourceHandler) deleteResource(w http.ResponseWriter, r *http.Request) {
-	claims := h.claimsExtractor.FromRequestContext(r)
-	accountID, userID, err := h.extractFromToken(r.Context(), claims)
+	userAuth, err := nbcontext.GetUserAuthFromContext(r.Context())
 	if err != nil {
 		util.WriteError(r.Context(), err, w)
 		return
 	}
+	accountID, userID := userAuth.AccountId, userAuth.UserId
 
 	networkID := mux.Vars(r)["networkId"]
 	resourceID := mux.Vars(r)["resourceId"]

@@ -12,14 +12,16 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/gorilla/mux"
-	"github.com/netbirdio/netbird/management/server/util"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/netbirdio/netbird/management/server/http/api"
-	"github.com/netbirdio/netbird/management/server/jwtclaims"
+	"github.com/netbirdio/netbird/management/server/util"
+
+	nbcontext "github.com/netbirdio/netbird/management/server/context"
 	"github.com/netbirdio/netbird/management/server/mock_server"
-	"github.com/netbirdio/netbird/management/server/status"
 	"github.com/netbirdio/netbird/management/server/types"
+	"github.com/netbirdio/netbird/shared/auth"
+	"github.com/netbirdio/netbird/shared/management/http/api"
+	"github.com/netbirdio/netbird/shared/management/status"
 )
 
 const (
@@ -77,10 +79,6 @@ func initPATTestData() *patHandler {
 					PersonalAccessToken: types.PersonalAccessToken{},
 				}, nil
 			},
-
-			GetAccountIDFromTokenFunc: func(_ context.Context, claims jwtclaims.AuthorizationClaims) (string, string, error) {
-				return claims.AccountId, claims.UserId, nil
-			},
 			DeletePATFunc: func(_ context.Context, accountID string, initiatorUserID string, targetUserID string, tokenID string) error {
 				if accountID != existingAccountID {
 					return status.Errorf(status.NotFound, "account with ID %s not found", accountID)
@@ -115,15 +113,6 @@ func initPATTestData() *patHandler {
 				return []*types.PersonalAccessToken{testAccount.Users[existingUserID].PATs[existingTokenID], testAccount.Users[existingUserID].PATs["token2"]}, nil
 			},
 		},
-		claimsExtractor: jwtclaims.NewClaimsExtractor(
-			jwtclaims.WithFromRequestContext(func(r *http.Request) jwtclaims.AuthorizationClaims {
-				return jwtclaims.AuthorizationClaims{
-					UserId:    existingUserID,
-					Domain:    testDomain,
-					AccountId: existingAccountID,
-				}
-			}),
-		),
 	}
 }
 
@@ -185,6 +174,11 @@ func TestTokenHandlers(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			req := httptest.NewRequest(tc.requestType, tc.requestPath, tc.requestBody)
+			req = nbcontext.SetUserAuthInRequest(req, auth.UserAuth{
+				UserId:    existingUserID,
+				Domain:    testDomain,
+				AccountId: existingAccountID,
+			})
 
 			router := mux.NewRouter()
 			router.HandleFunc("/api/users/{userId}/tokens", p.getAllTokens).Methods("GET")

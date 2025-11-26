@@ -17,15 +17,15 @@ import (
 	nberrors "github.com/netbirdio/netbird/client/errors"
 	firewall "github.com/netbirdio/netbird/client/firewall/manager"
 	"github.com/netbirdio/netbird/client/internal/acl/id"
-	"github.com/netbirdio/netbird/client/ssh"
-	mgmProto "github.com/netbirdio/netbird/management/proto"
+	"github.com/netbirdio/netbird/shared/management/domain"
+	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 )
 
 var ErrSourceRangesEmpty = errors.New("sources range is empty")
 
 // Manager is a ACL rules manager
 type Manager interface {
-	ApplyFiltering(networkMap *mgmProto.NetworkMap)
+	ApplyFiltering(networkMap *mgmProto.NetworkMap, dnsRouteFeatureFlag bool)
 }
 
 // DefaultManager uses firewall manager to handle
@@ -48,9 +48,14 @@ func NewDefaultManager(fm firewall.Manager) *DefaultManager {
 // ApplyFiltering firewall rules to the local firewall manager processed by ACL policy.
 //
 // If allowByDefault is true it appends allow ALL traffic rules to input and output chains.
-func (d *DefaultManager) ApplyFiltering(networkMap *mgmProto.NetworkMap) {
+func (d *DefaultManager) ApplyFiltering(networkMap *mgmProto.NetworkMap, dnsRouteFeatureFlag bool) {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
+
+	if d.firewall == nil {
+		log.Debug("firewall manager is not supported, skipping firewall rules")
+		return
+	}
 
 	start := time.Now()
 	defer func() {
@@ -63,21 +68,9 @@ func (d *DefaultManager) ApplyFiltering(networkMap *mgmProto.NetworkMap) {
 			time.Since(start), total)
 	}()
 
-	if d.firewall == nil {
-		log.Debug("firewall manager is not supported, skipping firewall rules")
-		return
-	}
-
 	d.applyPeerACLs(networkMap)
 
-	// If we got empty rules list but management did not set the networkMap.FirewallRulesIsEmpty flag,
-	// then the mgmt server is older than the client, and we need to allow all traffic for routes
-	isLegacy := len(networkMap.RoutesFirewallRules) == 0 && !networkMap.RoutesFirewallRulesIsEmpty
-	if err := d.firewall.SetLegacyManagement(isLegacy); err != nil {
-		log.Errorf("failed to set legacy management flag: %v", err)
-	}
-
-	if err := d.applyRouteACLs(networkMap.RoutesFirewallRules); err != nil {
+	if err := d.applyRouteACLs(networkMap.RoutesFirewallRules, dnsRouteFeatureFlag); err != nil {
 		log.Errorf("Failed to apply route ACLs: %v", err)
 	}
 
@@ -87,30 +80,7 @@ func (d *DefaultManager) ApplyFiltering(networkMap *mgmProto.NetworkMap) {
 }
 
 func (d *DefaultManager) applyPeerACLs(networkMap *mgmProto.NetworkMap) {
-	rules, squashedProtocols := d.squashAcceptRules(networkMap)
-
-	enableSSH := networkMap.PeerConfig != nil &&
-		networkMap.PeerConfig.SshConfig != nil &&
-		networkMap.PeerConfig.SshConfig.SshEnabled
-	if _, ok := squashedProtocols[mgmProto.RuleProtocol_ALL]; ok {
-		enableSSH = enableSSH && !ok
-	}
-	if _, ok := squashedProtocols[mgmProto.RuleProtocol_TCP]; ok {
-		enableSSH = enableSSH && !ok
-	}
-
-	// if TCP protocol rules not squashed and SSH enabled
-	// we add default firewall rule which accepts connection to any peer
-	// in the network by SSH (TCP 22 port).
-	if enableSSH {
-		rules = append(rules, &mgmProto.FirewallRule{
-			PeerIP:    "0.0.0.0",
-			Direction: mgmProto.RuleDirection_IN,
-			Action:    mgmProto.RuleAction_ACCEPT,
-			Protocol:  mgmProto.RuleProtocol_TCP,
-			Port:      strconv.Itoa(ssh.DefaultSSHPort),
-		})
-	}
+	rules := networkMap.FirewallRules
 
 	// if we got empty rules list but management not set networkMap.FirewallRulesIsEmpty flag
 	// we have old version of management without rules handling, we should allow all traffic
@@ -151,7 +121,7 @@ func (d *DefaultManager) applyPeerACLs(networkMap *mgmProto.NetworkMap) {
 			d.rollBack(newRulePairs)
 			break
 		}
-		if len(rules) > 0 {
+		if len(rulePair) > 0 {
 			d.peerRulesPairs[pairID] = rulePair
 			newRulePairs[pairID] = rulePair
 		}
@@ -171,16 +141,16 @@ func (d *DefaultManager) applyPeerACLs(networkMap *mgmProto.NetworkMap) {
 	d.peerRulesPairs = newRulePairs
 }
 
-func (d *DefaultManager) applyRouteACLs(rules []*mgmProto.RouteFirewallRule) error {
+func (d *DefaultManager) applyRouteACLs(rules []*mgmProto.RouteFirewallRule, dynamicResolver bool) error {
 	newRouteRules := make(map[id.RuleID]struct{}, len(rules))
 	var merr *multierror.Error
 
 	// Apply new rules - firewall manager will return existing rule ID if already present
 	for _, rule := range rules {
-		id, err := d.applyRouteACL(rule)
+		id, err := d.applyRouteACL(rule, dynamicResolver)
 		if err != nil {
 			if errors.Is(err, ErrSourceRangesEmpty) {
-				log.Debugf("skipping empty rule with destination %s: %v", rule.Destination, err)
+				log.Debugf("skipping empty sources rule with destination %s: %v", rule.Destination, err)
 			} else {
 				merr = multierror.Append(merr, fmt.Errorf("add route rule: %w", err))
 			}
@@ -203,7 +173,7 @@ func (d *DefaultManager) applyRouteACLs(rules []*mgmProto.RouteFirewallRule) err
 	return nberrors.FormatErrorOrNil(merr)
 }
 
-func (d *DefaultManager) applyRouteACL(rule *mgmProto.RouteFirewallRule) (id.RuleID, error) {
+func (d *DefaultManager) applyRouteACL(rule *mgmProto.RouteFirewallRule, dynamicResolver bool) (id.RuleID, error) {
 	if len(rule.SourceRanges) == 0 {
 		return "", ErrSourceRangesEmpty
 	}
@@ -217,15 +187,9 @@ func (d *DefaultManager) applyRouteACL(rule *mgmProto.RouteFirewallRule) (id.Rul
 		sources = append(sources, source)
 	}
 
-	var destination netip.Prefix
-	if rule.IsDynamic {
-		destination = getDefault(sources[0])
-	} else {
-		var err error
-		destination, err = netip.ParsePrefix(rule.Destination)
-		if err != nil {
-			return "", fmt.Errorf("parse destination: %w", err)
-		}
+	destination, err := determineDestination(rule, dynamicResolver, sources)
+	if err != nil {
+		return "", fmt.Errorf("determine destination: %w", err)
 	}
 
 	protocol, err := convertToFirewallProtocol(rule.Protocol)
@@ -240,12 +204,12 @@ func (d *DefaultManager) applyRouteACL(rule *mgmProto.RouteFirewallRule) (id.Rul
 
 	dPorts := convertPortInfo(rule.PortInfo)
 
-	addedRule, err := d.firewall.AddRouteFiltering(sources, destination, protocol, nil, dPorts, action)
+	addedRule, err := d.firewall.AddRouteFiltering(rule.PolicyID, sources, destination, protocol, nil, dPorts, action)
 	if err != nil {
 		return "", fmt.Errorf("add route rule: %w", err)
 	}
 
-	return id.RuleID(addedRule.GetRuleID()), nil
+	return id.RuleID(addedRule.ID()), nil
 }
 
 func (d *DefaultManager) protoRuleToFirewallRule(
@@ -268,17 +232,20 @@ func (d *DefaultManager) protoRuleToFirewallRule(
 	}
 
 	var port *firewall.Port
-	if r.Port != "" {
+	if !portInfoEmpty(r.PortInfo) {
+		port = convertPortInfo(r.PortInfo)
+	} else if r.Port != "" {
+		// old version of management, single port
 		value, err := strconv.Atoi(r.Port)
 		if err != nil {
-			return "", nil, fmt.Errorf("invalid port, skipping firewall rule")
+			return "", nil, fmt.Errorf("invalid port: %w", err)
 		}
 		port = &firewall.Port{
-			Values: []int{value},
+			Values: []uint16{uint16(value)},
 		}
 	}
 
-	ruleID := d.getPeerRuleID(ip, protocol, int(r.Direction), port, action, "")
+	ruleID := d.getPeerRuleID(ip, protocol, int(r.Direction), port, action)
 	if rulesPair, ok := d.peerRulesPairs[ruleID]; ok {
 		return ruleID, rulesPair, nil
 	}
@@ -286,9 +253,13 @@ func (d *DefaultManager) protoRuleToFirewallRule(
 	var rules []firewall.Rule
 	switch r.Direction {
 	case mgmProto.RuleDirection_IN:
-		rules, err = d.addInRules(ip, protocol, port, action, ipsetName, "")
+		rules, err = d.addInRules(r.PolicyID, ip, protocol, port, action, ipsetName)
 	case mgmProto.RuleDirection_OUT:
-		rules, err = d.addOutRules(ip, protocol, port, action, ipsetName, "")
+		if d.firewall.IsStateful() {
+			return "", nil, nil
+		}
+		// return traffic for outbound connections if firewall is stateless
+		rules, err = d.addOutRules(r.PolicyID, ip, protocol, port, action, ipsetName)
 	default:
 		return "", nil, fmt.Errorf("invalid direction, skipping firewall rule")
 	}
@@ -300,62 +271,56 @@ func (d *DefaultManager) protoRuleToFirewallRule(
 	return ruleID, rules, nil
 }
 
+func portInfoEmpty(portInfo *mgmProto.PortInfo) bool {
+	if portInfo == nil {
+		return true
+	}
+
+	switch portInfo.GetPortSelection().(type) {
+	case *mgmProto.PortInfo_Port:
+		return portInfo.GetPort() == 0
+	case *mgmProto.PortInfo_Range_:
+		r := portInfo.GetRange()
+		return r == nil || r.Start == 0 || r.End == 0
+	default:
+		return true
+	}
+}
+
 func (d *DefaultManager) addInRules(
+	id []byte,
 	ip net.IP,
 	protocol firewall.Protocol,
 	port *firewall.Port,
 	action firewall.Action,
 	ipsetName string,
-	comment string,
 ) ([]firewall.Rule, error) {
-	var rules []firewall.Rule
-	rule, err := d.firewall.AddPeerFiltering(
-		ip, protocol, nil, port, firewall.RuleDirectionIN, action, ipsetName, comment)
+	rule, err := d.firewall.AddPeerFiltering(id, ip, protocol, nil, port, action, ipsetName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to add firewall rule: %v", err)
-	}
-	rules = append(rules, rule...)
-
-	if shouldSkipInvertedRule(protocol, port) {
-		return rules, nil
+		return nil, fmt.Errorf("add firewall rule: %w", err)
 	}
 
-	rule, err = d.firewall.AddPeerFiltering(
-		ip, protocol, port, nil, firewall.RuleDirectionOUT, action, ipsetName, comment)
-	if err != nil {
-		return nil, fmt.Errorf("failed to add firewall rule: %v", err)
-	}
-
-	return append(rules, rule...), nil
+	return rule, nil
 }
 
 func (d *DefaultManager) addOutRules(
+	id []byte,
 	ip net.IP,
 	protocol firewall.Protocol,
 	port *firewall.Port,
 	action firewall.Action,
 	ipsetName string,
-	comment string,
 ) ([]firewall.Rule, error) {
-	var rules []firewall.Rule
-	rule, err := d.firewall.AddPeerFiltering(
-		ip, protocol, nil, port, firewall.RuleDirectionOUT, action, ipsetName, comment)
-	if err != nil {
-		return nil, fmt.Errorf("failed to add firewall rule: %v", err)
-	}
-	rules = append(rules, rule...)
-
 	if shouldSkipInvertedRule(protocol, port) {
-		return rules, nil
+		return nil, nil
 	}
 
-	rule, err = d.firewall.AddPeerFiltering(
-		ip, protocol, port, nil, firewall.RuleDirectionIN, action, ipsetName, comment)
+	rule, err := d.firewall.AddPeerFiltering(id, ip, protocol, port, nil, action, ipsetName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to add firewall rule: %v", err)
+		return nil, fmt.Errorf("add firewall rule: %w", err)
 	}
 
-	return append(rules, rule...), nil
+	return rule, nil
 }
 
 // getPeerRuleID() returns unique ID for the rule based on its parameters.
@@ -365,9 +330,8 @@ func (d *DefaultManager) getPeerRuleID(
 	direction int,
 	port *firewall.Port,
 	action firewall.Action,
-	comment string,
 ) id.RuleID {
-	idStr := ip.String() + string(proto) + strconv.Itoa(direction) + strconv.Itoa(int(action)) + comment
+	idStr := ip.String() + string(proto) + strconv.Itoa(direction) + strconv.Itoa(int(action))
 	if port != nil {
 		idStr += port.String()
 	}
@@ -375,140 +339,9 @@ func (d *DefaultManager) getPeerRuleID(
 	return id.RuleID(hex.EncodeToString(md5.New().Sum([]byte(idStr))))
 }
 
-// squashAcceptRules does complex logic to convert many rules which allows connection by traffic type
-// to all peers in the network map to one rule which just accepts that type of the traffic.
-//
-// NOTE: It will not squash two rules for same protocol if one covers all peers in the network,
-// but other has port definitions or has drop policy.
-func (d *DefaultManager) squashAcceptRules(
-	networkMap *mgmProto.NetworkMap,
-) ([]*mgmProto.FirewallRule, map[mgmProto.RuleProtocol]struct{}) {
-	totalIPs := 0
-	for _, p := range append(networkMap.RemotePeers, networkMap.OfflinePeers...) {
-		for range p.AllowedIps {
-			totalIPs++
-		}
-	}
-
-	type protoMatch map[mgmProto.RuleProtocol]map[string]int
-
-	in := protoMatch{}
-	out := protoMatch{}
-
-	// trace which type of protocols was squashed
-	squashedRules := []*mgmProto.FirewallRule{}
-	squashedProtocols := map[mgmProto.RuleProtocol]struct{}{}
-
-	// this function we use to do calculation, can we squash the rules by protocol or not.
-	// We summ amount of Peers IP for given protocol we found in original rules list.
-	// But we zeroed the IP's for protocol if:
-	// 1. Any of the rule has DROP action type.
-	// 2. Any of rule contains Port.
-	//
-	// We zeroed this to notify squash function that this protocol can't be squashed.
-	addRuleToCalculationMap := func(i int, r *mgmProto.FirewallRule, protocols protoMatch) {
-		drop := r.Action == mgmProto.RuleAction_DROP || r.Port != ""
-		if drop {
-			protocols[r.Protocol] = map[string]int{}
-			return
-		}
-		if _, ok := protocols[r.Protocol]; !ok {
-			protocols[r.Protocol] = map[string]int{}
-		}
-
-		// special case, when we receive this all network IP address
-		// it means that rules for that protocol was already optimized on the
-		// management side
-		if r.PeerIP == "0.0.0.0" {
-			squashedRules = append(squashedRules, r)
-			squashedProtocols[r.Protocol] = struct{}{}
-			return
-		}
-
-		ipset := protocols[r.Protocol]
-
-		if _, ok := ipset[r.PeerIP]; ok {
-			return
-		}
-		ipset[r.PeerIP] = i
-	}
-
-	for i, r := range networkMap.FirewallRules {
-		// calculate squash for different directions
-		if r.Direction == mgmProto.RuleDirection_IN {
-			addRuleToCalculationMap(i, r, in)
-		} else {
-			addRuleToCalculationMap(i, r, out)
-		}
-	}
-
-	// order of squashing by protocol is important
-	// only for their first element ALL, it must be done first
-	protocolOrders := []mgmProto.RuleProtocol{
-		mgmProto.RuleProtocol_ALL,
-		mgmProto.RuleProtocol_ICMP,
-		mgmProto.RuleProtocol_TCP,
-		mgmProto.RuleProtocol_UDP,
-	}
-
-	squash := func(matches protoMatch, direction mgmProto.RuleDirection) {
-		for _, protocol := range protocolOrders {
-			if ipset, ok := matches[protocol]; !ok || len(ipset) != totalIPs || len(ipset) < 2 {
-				// don't squash if :
-				// 1. Rules not cover all peers in the network
-				// 2. Rules cover only one peer in the network.
-				continue
-			}
-
-			// add special rule 0.0.0.0 which allows all IP's in our firewall implementations
-			squashedRules = append(squashedRules, &mgmProto.FirewallRule{
-				PeerIP:    "0.0.0.0",
-				Direction: direction,
-				Action:    mgmProto.RuleAction_ACCEPT,
-				Protocol:  protocol,
-			})
-			squashedProtocols[protocol] = struct{}{}
-
-			if protocol == mgmProto.RuleProtocol_ALL {
-				// if we have ALL traffic type squashed rule
-				// it allows all other type of traffic, so we can stop processing
-				break
-			}
-		}
-	}
-
-	squash(in, mgmProto.RuleDirection_IN)
-	squash(out, mgmProto.RuleDirection_OUT)
-
-	// if all protocol was squashed everything is allow and we can ignore all other rules
-	if _, ok := squashedProtocols[mgmProto.RuleProtocol_ALL]; ok {
-		return squashedRules, squashedProtocols
-	}
-
-	if len(squashedRules) == 0 {
-		return networkMap.FirewallRules, squashedProtocols
-	}
-
-	var rules []*mgmProto.FirewallRule
-	// filter out rules which was squashed from final list
-	// if we also have other not squashed rules.
-	for i, r := range networkMap.FirewallRules {
-		if _, ok := squashedProtocols[r.Protocol]; ok {
-			if m, ok := in[r.Protocol]; ok && m[r.PeerIP] == i {
-				continue
-			} else if m, ok := out[r.Protocol]; ok && m[r.PeerIP] == i {
-				continue
-			}
-		}
-		rules = append(rules, r)
-	}
-
-	return append(rules, squashedRules...), squashedProtocols
-}
-
 // getRuleGroupingSelector takes all rule properties except IP address to build selector
 func (d *DefaultManager) getRuleGroupingSelector(rule *mgmProto.FirewallRule) string {
-	return fmt.Sprintf("%v:%v:%v:%s", strconv.Itoa(int(rule.Direction)), rule.Action, rule.Protocol, rule.Port)
+	return fmt.Sprintf("%v:%v:%v:%s:%v", strconv.Itoa(int(rule.Direction)), rule.Action, rule.Protocol, rule.Port, rule.PortInfo)
 }
 
 func (d *DefaultManager) rollBack(newRulePairs map[id.RuleID][]firewall.Rule) {
@@ -516,7 +349,7 @@ func (d *DefaultManager) rollBack(newRulePairs map[id.RuleID][]firewall.Rule) {
 	for _, rules := range newRulePairs {
 		for _, rule := range rules {
 			if err := d.firewall.DeletePeerRule(rule); err != nil {
-				log.Errorf("failed to delete new firewall rule (id: %v) during rollback: %v", rule.GetRuleID(), err)
+				log.Errorf("failed to delete new firewall rule (id: %v) during rollback: %v", rule.ID(), err)
 			}
 		}
 	}
@@ -559,18 +392,45 @@ func convertPortInfo(portInfo *mgmProto.PortInfo) *firewall.Port {
 
 	if portInfo.GetPort() != 0 {
 		return &firewall.Port{
-			Values: []int{int(portInfo.GetPort())},
+			Values: []uint16{uint16(int(portInfo.GetPort()))},
 		}
 	}
 
 	if portInfo.GetRange() != nil {
 		return &firewall.Port{
 			IsRange: true,
-			Values:  []int{int(portInfo.GetRange().Start), int(portInfo.GetRange().End)},
+			Values:  []uint16{uint16(portInfo.GetRange().Start), uint16(portInfo.GetRange().End)},
 		}
 	}
 
 	return nil
+}
+
+func determineDestination(rule *mgmProto.RouteFirewallRule, dynamicResolver bool, sources []netip.Prefix) (firewall.Network, error) {
+	var destination firewall.Network
+
+	if rule.IsDynamic {
+		if dynamicResolver {
+			if len(rule.Domains) > 0 {
+				destination.Set = firewall.NewDomainSet(domain.FromPunycodeList(rule.Domains))
+			} else {
+				// isDynamic is set but no domains = outdated management server
+				log.Warn("connected to an older version of management server (no domains in rules), using default destination")
+				destination.Prefix = getDefault(sources[0])
+			}
+		} else {
+			// client resolves DNS, we (router) don't know the destination
+			destination.Prefix = getDefault(sources[0])
+		}
+		return destination, nil
+	}
+
+	prefix, err := netip.ParsePrefix(rule.Destination)
+	if err != nil {
+		return destination, fmt.Errorf("parse destination: %w", err)
+	}
+	destination.Prefix = prefix
+	return destination, nil
 }
 
 func getDefault(prefix netip.Prefix) netip.Prefix {

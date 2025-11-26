@@ -10,15 +10,17 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/netbirdio/netbird/client/internal/profilemanager"
 	"github.com/netbirdio/netbird/client/ssh"
 	"github.com/netbirdio/netbird/client/system"
-	mgm "github.com/netbirdio/netbird/management/client"
-	mgmProto "github.com/netbirdio/netbird/management/proto"
+	mgm "github.com/netbirdio/netbird/shared/management/client"
+	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 )
 
 // IsLoginRequired check that the server is support SSO or not
-func IsLoginRequired(ctx context.Context, privateKey string, mgmURL *url.URL, sshKey string) (bool, error) {
-	mgmClient, err := getMgmClient(ctx, privateKey, mgmURL)
+func IsLoginRequired(ctx context.Context, config *profilemanager.Config) (bool, error) {
+	mgmURL := config.ManagementURL
+	mgmClient, err := getMgmClient(ctx, config.PrivateKey, mgmURL)
 	if err != nil {
 		return false, err
 	}
@@ -33,12 +35,12 @@ func IsLoginRequired(ctx context.Context, privateKey string, mgmURL *url.URL, ss
 	}()
 	log.Debugf("connected to the Management service %s", mgmURL.String())
 
-	pubSSHKey, err := ssh.GeneratePublicKey([]byte(sshKey))
+	pubSSHKey, err := ssh.GeneratePublicKey([]byte(config.SSHKey))
 	if err != nil {
 		return false, err
 	}
 
-	_, err = doMgmLogin(ctx, mgmClient, pubSSHKey)
+	_, _, err = doMgmLogin(ctx, mgmClient, pubSSHKey, config)
 	if isLoginNeeded(err) {
 		return true, nil
 	}
@@ -46,7 +48,7 @@ func IsLoginRequired(ctx context.Context, privateKey string, mgmURL *url.URL, ss
 }
 
 // Login or register the client
-func Login(ctx context.Context, config *Config, setupKey string, jwtToken string) error {
+func Login(ctx context.Context, config *profilemanager.Config, setupKey string, jwtToken string) error {
 	mgmClient, err := getMgmClient(ctx, config.PrivateKey, config.ManagementURL)
 	if err != nil {
 		return err
@@ -67,14 +69,18 @@ func Login(ctx context.Context, config *Config, setupKey string, jwtToken string
 		return err
 	}
 
-	serverKey, err := doMgmLogin(ctx, mgmClient, pubSSHKey)
+	serverKey, _, err := doMgmLogin(ctx, mgmClient, pubSSHKey, config)
 	if serverKey != nil && isRegistrationNeeded(err) {
 		log.Debugf("peer registration required")
-		_, err = registerPeer(ctx, *serverKey, mgmClient, setupKey, jwtToken, pubSSHKey)
+		_, err = registerPeer(ctx, *serverKey, mgmClient, setupKey, jwtToken, pubSSHKey, config)
+		if err != nil {
+			return err
+		}
+	} else if err != nil {
 		return err
 	}
 
-	return err
+	return nil
 }
 
 func getMgmClient(ctx context.Context, privateKey string, mgmURL *url.URL) (*mgm.GrpcClient, error) {
@@ -99,21 +105,38 @@ func getMgmClient(ctx context.Context, privateKey string, mgmURL *url.URL) (*mgm
 	return mgmClient, err
 }
 
-func doMgmLogin(ctx context.Context, mgmClient *mgm.GrpcClient, pubSSHKey []byte) (*wgtypes.Key, error) {
+func doMgmLogin(ctx context.Context, mgmClient *mgm.GrpcClient, pubSSHKey []byte, config *profilemanager.Config) (*wgtypes.Key, *mgmProto.LoginResponse, error) {
 	serverKey, err := mgmClient.GetServerPublicKey()
 	if err != nil {
 		log.Errorf("failed while getting Management Service public key: %v", err)
-		return nil, err
+		return nil, nil, err
 	}
 
 	sysInfo := system.GetInfo(ctx)
-	_, err = mgmClient.Login(*serverKey, sysInfo, pubSSHKey)
-	return serverKey, err
+	sysInfo.SetFlags(
+		config.RosenpassEnabled,
+		config.RosenpassPermissive,
+		config.ServerSSHAllowed,
+		config.DisableClientRoutes,
+		config.DisableServerRoutes,
+		config.DisableDNS,
+		config.DisableFirewall,
+		config.BlockLANAccess,
+		config.BlockInbound,
+		config.LazyConnectionEnabled,
+		config.EnableSSHRoot,
+		config.EnableSSHSFTP,
+		config.EnableSSHLocalPortForwarding,
+		config.EnableSSHRemotePortForwarding,
+		config.DisableSSHAuth,
+	)
+	loginResp, err := mgmClient.Login(*serverKey, sysInfo, pubSSHKey, config.DNSLabels)
+	return serverKey, loginResp, err
 }
 
 // registerPeer checks whether setupKey was provided via cmd line and if not then it prompts user to enter a key.
 // Otherwise tries to register with the provided setupKey via command line.
-func registerPeer(ctx context.Context, serverPublicKey wgtypes.Key, client *mgm.GrpcClient, setupKey string, jwtToken string, pubSSHKey []byte) (*mgmProto.LoginResponse, error) {
+func registerPeer(ctx context.Context, serverPublicKey wgtypes.Key, client *mgm.GrpcClient, setupKey string, jwtToken string, pubSSHKey []byte, config *profilemanager.Config) (*mgmProto.LoginResponse, error) {
 	validSetupKey, err := uuid.Parse(setupKey)
 	if err != nil && jwtToken == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid setup-key or no sso information provided, err: %v", err)
@@ -121,9 +144,26 @@ func registerPeer(ctx context.Context, serverPublicKey wgtypes.Key, client *mgm.
 
 	log.Debugf("sending peer registration request to Management Service")
 	info := system.GetInfo(ctx)
-	loginResp, err := client.Register(serverPublicKey, validSetupKey.String(), jwtToken, info, pubSSHKey)
+	info.SetFlags(
+		config.RosenpassEnabled,
+		config.RosenpassPermissive,
+		config.ServerSSHAllowed,
+		config.DisableClientRoutes,
+		config.DisableServerRoutes,
+		config.DisableDNS,
+		config.DisableFirewall,
+		config.BlockLANAccess,
+		config.BlockInbound,
+		config.LazyConnectionEnabled,
+		config.EnableSSHRoot,
+		config.EnableSSHSFTP,
+		config.EnableSSHLocalPortForwarding,
+		config.EnableSSHRemotePortForwarding,
+		config.DisableSSHAuth,
+	)
+	loginResp, err := client.Register(serverPublicKey, validSetupKey.String(), jwtToken, info, pubSSHKey, config.DNSLabels)
 	if err != nil {
-		log.Errorf("failed registering peer %v,%s", err, validSetupKey.String())
+		log.Errorf("failed registering peer %v", err)
 		return nil, err
 	}
 

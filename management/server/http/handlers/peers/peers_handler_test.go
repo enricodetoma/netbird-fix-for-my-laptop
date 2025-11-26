@@ -9,35 +9,115 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/gorilla/mux"
+	"go.uber.org/mock/gomock"
 	"golang.org/x/exp/maps"
 
-	"github.com/netbirdio/netbird/management/server/http/api"
-	"github.com/netbirdio/netbird/management/server/jwtclaims"
+	"github.com/netbirdio/netbird/management/internals/controllers/network_map"
+	nbcontext "github.com/netbirdio/netbird/management/server/context"
 	nbpeer "github.com/netbirdio/netbird/management/server/peer"
 	"github.com/netbirdio/netbird/management/server/types"
+	"github.com/netbirdio/netbird/shared/auth"
+	"github.com/netbirdio/netbird/shared/management/http/api"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/netbirdio/netbird/management/server/mock_server"
 )
-
-type ctxKey string
 
 const (
 	testPeerID                = "test_peer"
 	noUpdateChannelTestPeerID = "no-update-channel"
 
-	adminUser          = "admin_user"
-	regularUser        = "regular_user"
-	serviceUser        = "service_user"
-	userIDKey   ctxKey = "user_id"
+	adminUser   = "admin_user"
+	regularUser = "regular_user"
+	serviceUser = "service_user"
 )
 
-func initTestMetaData(peers ...*nbpeer.Peer) *Handler {
+func initTestMetaData(t *testing.T, peers ...*nbpeer.Peer) *Handler {
+
+	peersMap := make(map[string]*nbpeer.Peer)
+	for _, peer := range peers {
+		peersMap[peer.ID] = peer.Copy()
+	}
+
+	policy := &types.Policy{
+		ID:        "policy",
+		AccountID: "test_id",
+		Name:      "policy",
+		Enabled:   true,
+		Rules: []*types.PolicyRule{
+			{
+				ID:            "rule",
+				Name:          "rule",
+				Enabled:       true,
+				Action:        "accept",
+				Destinations:  []string{"group1"},
+				Sources:       []string{"group1"},
+				Bidirectional: true,
+				Protocol:      "all",
+				Ports:         []string{"80"},
+			},
+		},
+	}
+
+	srvUser := types.NewRegularUser(serviceUser)
+	srvUser.IsServiceUser = true
+
+	account := &types.Account{
+		Id:     "test_id",
+		Domain: "hotmail.com",
+		Peers:  peersMap,
+		Users: map[string]*types.User{
+			adminUser:   types.NewAdminUser(adminUser),
+			regularUser: types.NewRegularUser(regularUser),
+			serviceUser: srvUser,
+		},
+		Groups: map[string]*types.Group{
+			"group1": {
+				ID:        "group1",
+				AccountID: "test_id",
+				Name:      "group1",
+				Issued:    "api",
+				Peers:     maps.Keys(peersMap),
+			},
+		},
+		Settings: &types.Settings{
+			PeerLoginExpirationEnabled: true,
+			PeerLoginExpiration:        time.Hour,
+		},
+		Policies: []*types.Policy{policy},
+		Network: &types.Network{
+			Identifier: "ciclqisab2ss43jdn8q0",
+			Net: net.IPNet{
+				IP:   net.ParseIP("100.67.0.0"),
+				Mask: net.IPv4Mask(255, 255, 0, 0),
+			},
+			Serial: 51,
+		},
+	}
+
+	ctrl := gomock.NewController(t)
+
+	networkMapController := network_map.NewMockController(ctrl)
+	networkMapController.EXPECT().
+		GetDNSDomain(gomock.Any()).
+		Return("domain").
+		AnyTimes()
+	networkMapController.EXPECT().
+		IsConnected(noUpdateChannelTestPeerID).
+		Return(false).
+		AnyTimes()
+	networkMapController.EXPECT().
+		IsConnected(gomock.Any()).
+		Return(true).
+		AnyTimes()
+
 	return &Handler{
 		accountManager: &mock_server.MockAccountManager{
 			UpdatePeerFunc: func(_ context.Context, accountID, userID string, update *nbpeer.Peer) (*nbpeer.Peer, error) {
@@ -53,6 +133,15 @@ func initTestMetaData(peers ...*nbpeer.Peer) *Handler {
 				p.Name = update.Name
 				return p, nil
 			},
+			UpdatePeerIPFunc: func(_ context.Context, accountID, userID, peerID string, newIP netip.Addr) error {
+				for _, peer := range peers {
+					if peer.ID == peerID {
+						peer.IP = net.IP(newIP.AsSlice())
+						return nil
+					}
+				}
+				return fmt.Errorf("peer not found")
+			},
 			GetPeerFunc: func(_ context.Context, accountID, peerID, userID string) (*nbpeer.Peer, error) {
 				var p *nbpeer.Peer
 				for _, peer := range peers {
@@ -63,77 +152,43 @@ func initTestMetaData(peers ...*nbpeer.Peer) *Handler {
 				}
 				return p, nil
 			},
-			GetPeersFunc: func(_ context.Context, accountID, userID string) ([]*nbpeer.Peer, error) {
+			GetUserByIDFunc: func(ctx context.Context, id string) (*types.User, error) {
+				switch id {
+				case adminUser:
+					return account.Users[adminUser], nil
+				case regularUser:
+					return account.Users[regularUser], nil
+				case serviceUser:
+					return account.Users[serviceUser], nil
+				default:
+					return nil, fmt.Errorf("user not found")
+				}
+			},
+			GetPeersFunc: func(_ context.Context, accountID, userID, nameFilter, ipFilter string) ([]*nbpeer.Peer, error) {
 				return peers, nil
 			},
-			GetDNSDomainFunc: func() string {
+			GetPeerGroupsFunc: func(ctx context.Context, accountID, peerID string) ([]*types.Group, error) {
+				peersID := make([]string, len(peers))
+				for _, peer := range peers {
+					peersID = append(peersID, peer.ID)
+				}
+				return []*types.Group{
+					{
+						ID:        "group1",
+						AccountID: accountID,
+						Name:      "group1",
+						Issued:    "api",
+						Peers:     peersID,
+					},
+				}, nil
+			},
+			GetDNSDomainFunc: func(settings *types.Settings) string {
 				return "netbird.selfhosted"
 			},
-			GetAccountIDFromTokenFunc: func(_ context.Context, claims jwtclaims.AuthorizationClaims) (string, string, error) {
-				return claims.AccountId, claims.UserId, nil
+			GetAccountFunc: func(ctx context.Context, accountID string) (*types.Account, error) {
+				return account, nil
 			},
 			GetAccountByIDFunc: func(ctx context.Context, accountID string, userID string) (*types.Account, error) {
-				peersMap := make(map[string]*nbpeer.Peer)
-				for _, peer := range peers {
-					peersMap[peer.ID] = peer.Copy()
-				}
-
-				policy := &types.Policy{
-					ID:        "policy",
-					AccountID: accountID,
-					Name:      "policy",
-					Enabled:   true,
-					Rules: []*types.PolicyRule{
-						{
-							ID:            "rule",
-							Name:          "rule",
-							Enabled:       true,
-							Action:        "accept",
-							Destinations:  []string{"group1"},
-							Sources:       []string{"group1"},
-							Bidirectional: true,
-							Protocol:      "all",
-							Ports:         []string{"80"},
-						},
-					},
-				}
-
-				srvUser := types.NewRegularUser(serviceUser)
-				srvUser.IsServiceUser = true
-
-				account := &types.Account{
-					Id:     accountID,
-					Domain: "hotmail.com",
-					Peers:  peersMap,
-					Users: map[string]*types.User{
-						adminUser:   types.NewAdminUser(adminUser),
-						regularUser: types.NewRegularUser(regularUser),
-						serviceUser: srvUser,
-					},
-					Groups: map[string]*types.Group{
-						"group1": {
-							ID:        "group1",
-							AccountID: accountID,
-							Name:      "group1",
-							Issued:    "api",
-							Peers:     maps.Keys(peersMap),
-						},
-					},
-					Settings: &types.Settings{
-						PeerLoginExpirationEnabled: true,
-						PeerLoginExpiration:        time.Hour,
-					},
-					Policies: []*types.Policy{policy},
-					Network: &types.Network{
-						Identifier: "ciclqisab2ss43jdn8q0",
-						Net: net.IPNet{
-							IP:   net.ParseIP("100.67.0.0"),
-							Mask: net.IPv4Mask(255, 255, 0, 0),
-						},
-						Serial: 51,
-					},
-				}
-
 				return account, nil
 			},
 			HasConnectedChannelFunc: func(peerID string) bool {
@@ -147,17 +202,11 @@ func initTestMetaData(peers ...*nbpeer.Peer) *Handler {
 				_, ok := statuses[peerID]
 				return ok
 			},
+			GetAccountSettingsFunc: func(ctx context.Context, accountID string, userID string) (*types.Settings, error) {
+				return account.Settings, nil
+			},
 		},
-		claimsExtractor: jwtclaims.NewClaimsExtractor(
-			jwtclaims.WithFromRequestContext(func(r *http.Request) jwtclaims.AuthorizationClaims {
-				userID := r.Context().Value(userIDKey).(string)
-				return jwtclaims.AuthorizationClaims{
-					UserId:    userID,
-					Domain:    "hotmail.com",
-					AccountId: "test_id",
-				}
-			}),
-		),
+		networkMapController: networkMapController,
 	}
 }
 
@@ -241,15 +290,18 @@ func TestGetPeers(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 
-	p := initTestMetaData(peer, peer1)
+	p := initTestMetaData(t, peer, peer1)
 
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
 
 			recorder := httptest.NewRecorder()
 			req := httptest.NewRequest(tc.requestType, tc.requestPath, tc.requestBody)
-			ctx := context.WithValue(context.Background(), userIDKey, "admin_user")
-			req = req.WithContext(ctx)
+			req = nbcontext.SetUserAuthInRequest(req, auth.UserAuth{
+				UserId:    "admin_user",
+				Domain:    "hotmail.com",
+				AccountId: "test_id",
+			})
 
 			router := mux.NewRouter()
 			router.HandleFunc("/api/peers/", p.GetAllPeers).Methods("GET")
@@ -342,7 +394,7 @@ func TestGetAccessiblePeers(t *testing.T) {
 		UserID:                 regularUser,
 	}
 
-	p := initTestMetaData(peer1, peer2, peer3)
+	p := initTestMetaData(t, peer1, peer2, peer3)
 
 	tt := []struct {
 		name           string
@@ -393,8 +445,11 @@ func TestGetAccessiblePeers(t *testing.T) {
 
 			recorder := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/peers/%s/accessible-peers", tc.peerID), nil)
-			ctx := context.WithValue(context.Background(), userIDKey, tc.callerUserID)
-			req = req.WithContext(ctx)
+			req = nbcontext.SetUserAuthInRequest(req, auth.UserAuth{
+				UserId:    tc.callerUserID,
+				Domain:    "hotmail.com",
+				AccountId: "test_id",
+			})
 
 			router := mux.NewRouter()
 			router.HandleFunc("/api/peers/{peerId}/accessible-peers", p.GetAccessiblePeers).Methods("GET")
@@ -423,6 +478,76 @@ func TestGetAccessiblePeers(t *testing.T) {
 			}
 
 			assert.ElementsMatch(t, peerIDs, tc.expectedPeers)
+		})
+	}
+}
+
+func TestPeersHandlerUpdatePeerIP(t *testing.T) {
+	testPeer := &nbpeer.Peer{
+		ID:                     testPeerID,
+		Key:                    "key",
+		IP:                     net.ParseIP("100.64.0.1"),
+		Status:                 &nbpeer.PeerStatus{Connected: false, LastSeen: time.Now()},
+		Name:                   "test-host@netbird.io",
+		LoginExpirationEnabled: false,
+		UserID:                 regularUser,
+		Meta: nbpeer.PeerSystemMeta{
+			Hostname: "test-host@netbird.io",
+			Core:     "22.04",
+		},
+	}
+
+	p := initTestMetaData(t, testPeer)
+
+	tt := []struct {
+		name           string
+		peerID         string
+		requestBody    string
+		callerUserID   string
+		expectedStatus int
+		expectedIP     string
+	}{
+		{
+			name:           "update peer IP successfully",
+			peerID:         testPeerID,
+			requestBody:    `{"ip": "100.64.0.100"}`,
+			callerUserID:   adminUser,
+			expectedStatus: http.StatusOK,
+			expectedIP:     "100.64.0.100",
+		},
+		{
+			name:           "update peer IP with invalid IP",
+			peerID:         testPeerID,
+			requestBody:    `{"ip": "invalid-ip"}`,
+			callerUserID:   adminUser,
+			expectedStatus: http.StatusUnprocessableEntity,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/peers/%s", tc.peerID), bytes.NewBuffer([]byte(tc.requestBody)))
+			req.Header.Set("Content-Type", "application/json")
+			req = nbcontext.SetUserAuthInRequest(req, auth.UserAuth{
+				UserId:    tc.callerUserID,
+				Domain:    "hotmail.com",
+				AccountId: "test_id",
+			})
+
+			rr := httptest.NewRecorder()
+			router := mux.NewRouter()
+			router.HandleFunc("/peers/{peerId}", p.HandlePeer).Methods("PUT")
+
+			router.ServeHTTP(rr, req)
+
+			assert.Equal(t, tc.expectedStatus, rr.Code)
+
+			if tc.expectedStatus == http.StatusOK && tc.expectedIP != "" {
+				var updatedPeer api.Peer
+				err := json.Unmarshal(rr.Body.Bytes(), &updatedPeer)
+				require.NoError(t, err)
+				assert.Equal(t, tc.expectedIP, updatedPeer.Ip)
+			}
 		})
 	}
 }

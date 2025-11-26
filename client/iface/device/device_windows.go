@@ -8,30 +8,33 @@ import (
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
+	"golang.zx2c4.com/wireguard/tun/netstack"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 
 	"github.com/netbirdio/netbird/client/iface/bind"
 	"github.com/netbirdio/netbird/client/iface/configurer"
+	"github.com/netbirdio/netbird/client/iface/udpmux"
+	"github.com/netbirdio/netbird/client/iface/wgaddr"
 )
 
 const defaultWindowsGUIDSTring = "{f2f29e61-d91f-4d76-8151-119b20c4bdeb}"
 
 type TunDevice struct {
 	name    string
-	address WGAddress
+	address wgaddr.Address
 	port    int
 	key     string
-	mtu     int
+	mtu     uint16
 	iceBind *bind.ICEBind
 
 	device          *device.Device
 	nativeTunDevice *tun.NativeTun
 	filteredDevice  *FilteredDevice
-	udpMux          *bind.UniversalUDPMuxDefault
+	udpMux          *udpmux.UniversalUDPMuxDefault
 	configurer      WGConfigurer
 }
 
-func NewTunDevice(name string, address WGAddress, port int, key string, mtu int, iceBind *bind.ICEBind) *TunDevice {
+func NewTunDevice(name string, address wgaddr.Address, port int, key string, mtu uint16, iceBind *bind.ICEBind) *TunDevice {
 	return &TunDevice{
 		name:    name,
 		address: address,
@@ -57,7 +60,7 @@ func (t *TunDevice) Create() (WGConfigurer, error) {
 		return nil, err
 	}
 	log.Info("create tun interface")
-	tunDevice, err := tun.CreateTUNWithRequestedGUID(t.name, &guid, t.mtu)
+	tunDevice, err := tun.CreateTUNWithRequestedGUID(t.name, &guid, int(t.mtu))
 	if err != nil {
 		return nil, fmt.Errorf("error creating tun device: %s", err)
 	}
@@ -92,7 +95,7 @@ func (t *TunDevice) Create() (WGConfigurer, error) {
 		return nil, fmt.Errorf("error assigning ip: %s", err)
 	}
 
-	t.configurer = configurer.NewUSPConfigurer(t.device, t.name)
+	t.configurer = configurer.NewUSPConfigurer(t.device, t.name, t.iceBind.ActivityRecorder())
 	err = t.configurer.ConfigureInterface(t.key, t.port)
 	if err != nil {
 		t.device.Close()
@@ -102,7 +105,7 @@ func (t *TunDevice) Create() (WGConfigurer, error) {
 	return t.configurer, nil
 }
 
-func (t *TunDevice) Up() (*bind.UniversalUDPMuxDefault, error) {
+func (t *TunDevice) Up() (*udpmux.UniversalUDPMuxDefault, error) {
 	err := t.device.Up()
 	if err != nil {
 		return nil, err
@@ -117,7 +120,7 @@ func (t *TunDevice) Up() (*bind.UniversalUDPMuxDefault, error) {
 	return udpMux, nil
 }
 
-func (t *TunDevice) UpdateAddr(address WGAddress) error {
+func (t *TunDevice) UpdateAddr(address wgaddr.Address) error {
 	t.address = address
 	return t.assignAddr()
 }
@@ -138,8 +141,12 @@ func (t *TunDevice) Close() error {
 	}
 	return nil
 }
-func (t *TunDevice) WgAddress() WGAddress {
+func (t *TunDevice) WgAddress() wgaddr.Address {
 	return t.address
+}
+
+func (t *TunDevice) MTU() uint16 {
+	return t.mtu
 }
 
 func (t *TunDevice) DeviceName() string {
@@ -148,6 +155,11 @@ func (t *TunDevice) DeviceName() string {
 
 func (t *TunDevice) FilteredDevice() *FilteredDevice {
 	return t.filteredDevice
+}
+
+// Device returns the wireguard device
+func (t *TunDevice) Device() *device.Device {
+	return t.device
 }
 
 func (t *TunDevice) GetInterfaceGUIDString() (string, error) {
@@ -168,4 +180,13 @@ func (t *TunDevice) assignAddr() error {
 	luid := winipcfg.LUID(t.nativeTunDevice.LUID())
 	log.Debugf("adding address %s to interface: %s", t.address.IP, t.name)
 	return luid.SetIPAddresses([]netip.Prefix{netip.MustParsePrefix(t.address.String())})
+}
+
+func (t *TunDevice) GetNet() *netstack.Net {
+	return nil
+}
+
+// GetICEBind returns the ICEBind instance
+func (t *TunDevice) GetICEBind() EndpointManager {
+	return t.iceBind
 }

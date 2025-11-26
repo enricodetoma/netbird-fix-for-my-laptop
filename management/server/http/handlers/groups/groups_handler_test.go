@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,17 +14,18 @@ import (
 	"testing"
 
 	"github.com/gorilla/mux"
-	"github.com/magiconair/properties/assert"
+	"github.com/stretchr/testify/assert"
 	"golang.org/x/exp/maps"
 
 	"github.com/netbirdio/netbird/management/server"
-	"github.com/netbirdio/netbird/management/server/http/api"
-	"github.com/netbirdio/netbird/management/server/http/util"
-	"github.com/netbirdio/netbird/management/server/jwtclaims"
+	nbcontext "github.com/netbirdio/netbird/management/server/context"
 	"github.com/netbirdio/netbird/management/server/mock_server"
 	nbpeer "github.com/netbirdio/netbird/management/server/peer"
-	"github.com/netbirdio/netbird/management/server/status"
 	"github.com/netbirdio/netbird/management/server/types"
+	"github.com/netbirdio/netbird/shared/auth"
+	"github.com/netbirdio/netbird/shared/management/http/api"
+	"github.com/netbirdio/netbird/shared/management/http/util"
+	"github.com/netbirdio/netbird/shared/management/status"
 )
 
 var TestPeers = map[string]*nbpeer.Peer{
@@ -34,7 +36,7 @@ var TestPeers = map[string]*nbpeer.Peer{
 func initGroupTestData(initGroups ...*types.Group) *handler {
 	return &handler{
 		accountManager: &mock_server.MockAccountManager{
-			SaveGroupFunc: func(_ context.Context, accountID, userID string, group *types.Group) error {
+			SaveGroupFunc: func(_ context.Context, accountID, userID string, group *types.Group, create bool) error {
 				if !strings.HasPrefix(group.ID, "id-") {
 					group.ID = "id-was-set"
 				}
@@ -58,9 +60,6 @@ func initGroupTestData(initGroups ...*types.Group) *handler {
 
 				return group, nil
 			},
-			GetAccountIDFromTokenFunc: func(_ context.Context, claims jwtclaims.AuthorizationClaims) (string, string, error) {
-				return claims.AccountId, claims.UserId, nil
-			},
 			GetGroupByNameFunc: func(ctx context.Context, groupName, _ string) (*types.Group, error) {
 				if groupName == "All" {
 					return &types.Group{ID: "id-all", Name: "All", Issued: types.GroupIssuedAPI}, nil
@@ -68,15 +67,17 @@ func initGroupTestData(initGroups ...*types.Group) *handler {
 
 				return nil, fmt.Errorf("unknown group name")
 			},
-			GetPeersFunc: func(ctx context.Context, accountID, userID string) ([]*nbpeer.Peer, error) {
+			GetPeersFunc: func(ctx context.Context, accountID, userID, nameFilter, ipFilter string) ([]*nbpeer.Peer, error) {
 				return maps.Values(TestPeers), nil
 			},
 			DeleteGroupFunc: func(_ context.Context, accountID, userId, groupID string) error {
 				if groupID == "linked-grp" {
-					return &server.GroupLinkError{
+					err := &server.GroupLinkError{
 						Resource: "something",
 						Name:     "linked-grp",
 					}
+					var allErrors error
+					return errors.Join(allErrors, err)
 				}
 				if groupID == "invalid-grp" {
 					return fmt.Errorf("internal error")
@@ -84,15 +85,6 @@ func initGroupTestData(initGroups ...*types.Group) *handler {
 				return nil
 			},
 		},
-		claimsExtractor: jwtclaims.NewClaimsExtractor(
-			jwtclaims.WithFromRequestContext(func(r *http.Request) jwtclaims.AuthorizationClaims {
-				return jwtclaims.AuthorizationClaims{
-					UserId:    "test_user",
-					Domain:    "hotmail.com",
-					AccountId: "test_id",
-				}
-			}),
-		),
 	}
 }
 
@@ -131,6 +123,11 @@ func TestGetGroup(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			req := httptest.NewRequest(tc.requestType, tc.requestPath, tc.requestBody)
+			req = nbcontext.SetUserAuthInRequest(req, auth.UserAuth{
+				UserId:    "test_user",
+				Domain:    "hotmail.com",
+				AccountId: "test_id",
+			})
 
 			router := mux.NewRouter()
 			router.HandleFunc("/api/groups/{groupId}", p.getGroup).Methods("GET")
@@ -252,6 +249,11 @@ func TestWriteGroup(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			req := httptest.NewRequest(tc.requestType, tc.requestPath, tc.requestBody)
+			req = nbcontext.SetUserAuthInRequest(req, auth.UserAuth{
+				UserId:    "test_user",
+				Domain:    "hotmail.com",
+				AccountId: "test_id",
+			})
 
 			router := mux.NewRouter()
 			router.HandleFunc("/api/groups", p.createGroup).Methods("POST")
@@ -329,7 +331,11 @@ func TestDeleteGroup(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			req := httptest.NewRequest(tc.requestType, tc.requestPath, nil)
-
+			req = nbcontext.SetUserAuthInRequest(req, auth.UserAuth{
+				UserId:    "test_user",
+				Domain:    "hotmail.com",
+				AccountId: "test_id",
+			})
 			router := mux.NewRouter()
 			router.HandleFunc("/api/groups/{groupId}", p.deleteGroup).Methods("DELETE")
 			router.ServeHTTP(recorder, req)

@@ -5,20 +5,21 @@ import (
 	"sync"
 
 	"github.com/netbirdio/netbird/client/iface"
-	"github.com/netbirdio/netbird/client/iface/device"
+	"github.com/netbirdio/netbird/client/iface/wgaddr"
 )
 
 type InterfaceState struct {
-	NameStr       string          `json:"name"`
-	WGAddress     iface.WGAddress `json:"wg_address"`
-	UserspaceBind bool            `json:"userspace_bind"`
+	NameStr       string         `json:"name"`
+	WGAddress     wgaddr.Address `json:"wg_address"`
+	UserspaceBind bool           `json:"userspace_bind"`
+	MTU           uint16         `json:"mtu"`
 }
 
 func (i *InterfaceState) Name() string {
 	return i.NameStr
 }
 
-func (i *InterfaceState) Address() device.WGAddress {
+func (i *InterfaceState) Address() wgaddr.Address {
 	return i.WGAddress
 }
 
@@ -43,7 +44,11 @@ func (s *ShutdownState) Name() string {
 }
 
 func (s *ShutdownState) Cleanup() error {
-	ipt, err := Create(s.InterfaceState)
+	mtu := s.InterfaceState.MTU
+	if mtu == 0 {
+		mtu = iface.DefaultMTU
+	}
+	ipt, err := Create(s.InterfaceState, mtu)
 	if err != nil {
 		return fmt.Errorf("create iptables manager: %w", err)
 	}
@@ -62,7 +67,7 @@ func (s *ShutdownState) Cleanup() error {
 		ipt.aclMgr.ipsetStore = s.ACLIPsetStore
 	}
 
-	if err := ipt.Reset(nil); err != nil {
+	if err := ipt.Close(nil); err != nil {
 		return fmt.Errorf("reset iptables manager: %w", err)
 	}
 

@@ -14,7 +14,8 @@ import (
 
 	firewall "github.com/netbirdio/netbird/client/firewall/manager"
 	"github.com/netbirdio/netbird/client/firewall/test"
-	nbnet "github.com/netbirdio/netbird/util/net"
+	"github.com/netbirdio/netbird/client/iface"
+	nbnet "github.com/netbirdio/netbird/client/net"
 )
 
 func isIptablesSupported() bool {
@@ -30,7 +31,7 @@ func TestIptablesManager_RestoreOrCreateContainers(t *testing.T) {
 	iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 	require.NoError(t, err, "failed to init iptables client")
 
-	manager, err := newRouter(iptablesClient, ifaceMock)
+	manager, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU)
 	require.NoError(t, err, "should return a valid iptables manager")
 	require.NoError(t, manager.init(nil))
 
@@ -38,13 +39,18 @@ func TestIptablesManager_RestoreOrCreateContainers(t *testing.T) {
 		assert.NoError(t, manager.Reset(), "shouldn't return error")
 	}()
 
-	// Now 5 rules:
-	// 1. established rule in forward chain
-	// 2. jump rule to NAT chain
-	// 3. jump rule to PRE chain
-	// 4. static outbound masquerade rule
-	// 5. static return masquerade rule
-	require.Len(t, manager.rules, 5, "should have created rules map")
+	// 1. established rule forward in
+	// 2. estbalished rule forward out
+	// 3. jump rule to POST nat chain
+	// 4. jump rule to PRE mangle chain
+	// 5. jump rule to PRE nat chain
+	// 6. static outbound masquerade rule
+	// 7. static return masquerade rule
+	// 8. mangle prerouting mark rule
+	// 9. mangle postrouting mark rule
+	// 10. jump rule to MSS clamping chain
+	// 11. MSS clamping rule for outbound traffic
+	require.Len(t, manager.rules, 11, "should have created rules map")
 
 	exists, err := manager.iptablesClient.Exists(tableNat, chainPOSTROUTING, "-j", chainRTNAT)
 	require.NoError(t, err, "should be able to query the iptables %s table and %s chain", tableNat, chainPOSTROUTING)
@@ -56,8 +62,8 @@ func TestIptablesManager_RestoreOrCreateContainers(t *testing.T) {
 
 	pair := firewall.RouterPair{
 		ID:          "abc",
-		Source:      netip.MustParsePrefix("100.100.100.1/32"),
-		Destination: netip.MustParsePrefix("100.100.100.0/24"),
+		Source:      firewall.Network{Prefix: netip.MustParsePrefix("100.100.100.1/32")},
+		Destination: firewall.Network{Prefix: netip.MustParsePrefix("100.100.100.0/24")},
 		Masquerade:  true,
 	}
 
@@ -78,7 +84,7 @@ func TestIptablesManager_AddNatRule(t *testing.T) {
 			iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 			require.NoError(t, err, "failed to init iptables client")
 
-			manager, err := newRouter(iptablesClient, ifaceMock)
+			manager, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU)
 			require.NoError(t, err, "shouldn't return error")
 			require.NoError(t, manager.init(nil))
 
@@ -151,7 +157,7 @@ func TestIptablesManager_RemoveNatRule(t *testing.T) {
 		t.Run(testCase.Name, func(t *testing.T) {
 			iptablesClient, _ := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 
-			manager, err := newRouter(iptablesClient, ifaceMock)
+			manager, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU)
 			require.NoError(t, err, "shouldn't return error")
 			require.NoError(t, manager.init(nil))
 			defer func() {
@@ -213,7 +219,7 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 	iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 	require.NoError(t, err, "Failed to create iptables client")
 
-	r, err := newRouter(iptablesClient, ifaceMock)
+	r, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU)
 	require.NoError(t, err, "Failed to create router manager")
 	require.NoError(t, r.init(nil))
 
@@ -239,7 +245,7 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 			destination: netip.MustParsePrefix("10.0.0.0/24"),
 			proto:       firewall.ProtocolTCP,
 			sPort:       nil,
-			dPort:       &firewall.Port{Values: []int{80}},
+			dPort:       &firewall.Port{Values: []uint16{80}},
 			direction:   firewall.RuleDirectionIN,
 			action:      firewall.ActionAccept,
 			expectSet:   false,
@@ -252,7 +258,7 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 			},
 			destination: netip.MustParsePrefix("10.0.0.0/8"),
 			proto:       firewall.ProtocolUDP,
-			sPort:       &firewall.Port{Values: []int{1024, 2048}, IsRange: true},
+			sPort:       &firewall.Port{Values: []uint16{1024, 2048}, IsRange: true},
 			dPort:       nil,
 			direction:   firewall.RuleDirectionOUT,
 			action:      firewall.ActionDrop,
@@ -285,7 +291,7 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 			sources:     []netip.Prefix{netip.MustParsePrefix("172.16.0.0/12")},
 			destination: netip.MustParsePrefix("192.168.0.0/16"),
 			proto:       firewall.ProtocolTCP,
-			sPort:       &firewall.Port{Values: []int{80, 443, 8080}},
+			sPort:       &firewall.Port{Values: []uint16{80, 443, 8080}},
 			dPort:       nil,
 			direction:   firewall.RuleDirectionOUT,
 			action:      firewall.ActionAccept,
@@ -297,7 +303,7 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 			destination: netip.MustParsePrefix("10.0.0.0/24"),
 			proto:       firewall.ProtocolUDP,
 			sPort:       nil,
-			dPort:       &firewall.Port{Values: []int{5000, 5100}, IsRange: true},
+			dPort:       &firewall.Port{Values: []uint16{5000, 5100}, IsRange: true},
 			direction:   firewall.RuleDirectionIN,
 			action:      firewall.ActionDrop,
 			expectSet:   false,
@@ -307,8 +313,8 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 			sources:     []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")},
 			destination: netip.MustParsePrefix("172.16.0.0/16"),
 			proto:       firewall.ProtocolTCP,
-			sPort:       &firewall.Port{Values: []int{1024, 65535}, IsRange: true},
-			dPort:       &firewall.Port{Values: []int{22}},
+			sPort:       &firewall.Port{Values: []uint16{1024, 65535}, IsRange: true},
+			dPort:       &firewall.Port{Values: []uint16{22}},
 			direction:   firewall.RuleDirectionOUT,
 			action:      firewall.ActionAccept,
 			expectSet:   false,
@@ -328,38 +334,44 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ruleKey, err := r.AddRouteFiltering(tt.sources, tt.destination, tt.proto, tt.sPort, tt.dPort, tt.action)
+			ruleKey, err := r.AddRouteFiltering(nil, tt.sources, firewall.Network{Prefix: tt.destination}, tt.proto, tt.sPort, tt.dPort, tt.action)
 			require.NoError(t, err, "AddRouteFiltering failed")
 
 			// Check if the rule is in the internal map
-			rule, ok := r.rules[ruleKey.GetRuleID()]
+			rule, ok := r.rules[ruleKey.ID()]
 			assert.True(t, ok, "Rule not found in internal map")
 
 			// Log the internal rule
 			t.Logf("Internal rule: %v", rule)
 
 			// Check if the rule exists in iptables
-			exists, err := iptablesClient.Exists(tableFilter, chainRTFWD, rule...)
+			exists, err := iptablesClient.Exists(tableFilter, chainRTFWDIN, rule...)
 			assert.NoError(t, err, "Failed to check rule existence")
 			assert.True(t, exists, "Rule not found in iptables")
 
+			var source firewall.Network
+			if len(tt.sources) > 1 {
+				source.Set = firewall.NewPrefixSet(tt.sources)
+			} else if len(tt.sources) > 0 {
+				source.Prefix = tt.sources[0]
+			}
 			// Verify rule content
 			params := routeFilteringRuleParams{
-				Sources:     tt.sources,
-				Destination: tt.destination,
+				Source:      source,
+				Destination: firewall.Network{Prefix: tt.destination},
 				Proto:       tt.proto,
 				SPort:       tt.sPort,
 				DPort:       tt.dPort,
 				Action:      tt.action,
-				SetName:     "",
 			}
 
-			expectedRule := genRouteFilteringRuleSpec(params)
+			expectedRule, err := r.genRouteRuleSpec(params, nil)
+			require.NoError(t, err, "Failed to generate expected rule spec")
 
 			if tt.expectSet {
-				setName := firewall.GenerateSetName(tt.sources)
-				params.SetName = setName
-				expectedRule = genRouteFilteringRuleSpec(params)
+				setName := firewall.NewPrefixSet(tt.sources).HashedName()
+				expectedRule, err = r.genRouteRuleSpec(params, nil)
+				require.NoError(t, err, "Failed to generate expected rule spec with set")
 
 				// Check if the set was created
 				_, exists := r.ipsetCounter.Get(setName)
@@ -371,6 +383,65 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 			// Clean up
 			err = r.DeleteRouteRule(ruleKey)
 			require.NoError(t, err, "Failed to delete rule")
+		})
+	}
+}
+
+func TestFindSetNameInRule(t *testing.T) {
+	r := &router{}
+
+	testCases := []struct {
+		name     string
+		rule     []string
+		expected []string
+	}{
+		{
+			name: "Basic rule with two sets",
+			rule: []string{
+				"-A", "NETBIRD-RT-FWD-IN", "-p", "tcp", "-m", "set", "--match-set", "nb-2e5a2a05", "src",
+				"-m", "set", "--match-set", "nb-349ae051", "dst", "-m", "tcp", "--dport", "8080", "-j", "ACCEPT",
+			},
+			expected: []string{"nb-2e5a2a05", "nb-349ae051"},
+		},
+		{
+			name:     "No sets",
+			rule:     []string{"-A", "NETBIRD-RT-FWD-IN", "-p", "tcp", "-j", "ACCEPT"},
+			expected: []string{},
+		},
+		{
+			name: "Multiple sets with different positions",
+			rule: []string{
+				"-m", "set", "--match-set", "set1", "src", "-p", "tcp",
+				"-m", "set", "--match-set", "set-abc123", "dst", "-j", "ACCEPT",
+			},
+			expected: []string{"set1", "set-abc123"},
+		},
+		{
+			name:     "Boundary case - sequence appears at end",
+			rule:     []string{"-p", "tcp", "-m", "set", "--match-set", "final-set"},
+			expected: []string{"final-set"},
+		},
+		{
+			name:     "Incomplete pattern - missing set name",
+			rule:     []string{"-p", "tcp", "-m", "set", "--match-set"},
+			expected: []string{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := r.findSets(tc.rule)
+
+			if len(result) != len(tc.expected) {
+				t.Errorf("Expected %d sets, got %d. Sets found: %v", len(tc.expected), len(result), result)
+				return
+			}
+
+			for i, set := range result {
+				if set != tc.expected[i] {
+					t.Errorf("Expected set %q at position %d, got %q", tc.expected[i], i, set)
+				}
+			}
 		})
 	}
 }

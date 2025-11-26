@@ -13,7 +13,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/netbirdio/netbird/management/server/status"
+	"github.com/netbirdio/netbird/shared/management/status"
 )
 
 type GeoNames struct {
@@ -132,8 +132,7 @@ func connectDB(ctx context.Context, filePath string) (*gorm.DB, error) {
 	}
 
 	db, err := gorm.Open(sqlite.Open(storeStr), &gorm.Config{
-		Logger:      logger.Default.LogMode(logger.Silent),
-		PrepareStmt: true,
+		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
 		return nil, err

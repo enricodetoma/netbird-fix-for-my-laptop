@@ -3,28 +3,50 @@ package iface
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/pion/transport/v3"
 	log "github.com/sirupsen/logrus"
+	"golang.zx2c4.com/wireguard/tun/netstack"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
+	wgdevice "golang.zx2c4.com/wireguard/device"
+
 	"github.com/netbirdio/netbird/client/errors"
-	"github.com/netbirdio/netbird/client/iface/bind"
 	"github.com/netbirdio/netbird/client/iface/configurer"
 	"github.com/netbirdio/netbird/client/iface/device"
+	"github.com/netbirdio/netbird/client/iface/udpmux"
+	"github.com/netbirdio/netbird/client/iface/wgaddr"
 	"github.com/netbirdio/netbird/client/iface/wgproxy"
+	"github.com/netbirdio/netbird/monotime"
 )
 
 const (
 	DefaultMTU         = 1280
+	MinMTU             = 576
+	MaxMTU             = 8192
 	DefaultWgPort      = 51820
 	WgInterfaceDefault = configurer.WgInterfaceDefault
 )
 
-type WGAddress = device.WGAddress
+var (
+	// ErrIfaceNotFound is returned when the WireGuard interface is not found
+	ErrIfaceNotFound = fmt.Errorf("wireguard interface not found")
+)
+
+// ValidateMTU validates that MTU is within acceptable range
+func ValidateMTU(mtu uint16) error {
+	if mtu < MinMTU {
+		return fmt.Errorf("MTU %d below minimum (%d bytes)", mtu, MinMTU)
+	}
+	if mtu > MaxMTU {
+		return fmt.Errorf("MTU %d exceeds maximum supported size (%d bytes)", mtu, MaxMTU)
+	}
+	return nil
+}
 
 type wgProxyFactory interface {
 	GetProxy() wgproxy.Proxy
@@ -36,10 +58,11 @@ type WGIFaceOpts struct {
 	Address      string
 	WGPort       int
 	WGPrivKey    string
-	MTU          int
+	MTU          uint16
 	MobileArgs   *device.MobileIFaceArguments
 	TransportNet transport.Net
-	FilterFn     bind.FilterFn
+	FilterFn     udpmux.FilterFn
+	DisableDNS   bool
 }
 
 // WGIface represents an interface instance
@@ -57,6 +80,17 @@ func (w *WGIface) GetProxy() wgproxy.Proxy {
 	return w.wgProxyFactory.GetProxy()
 }
 
+// GetBind returns the EndpointManager userspace bind mode.
+func (w *WGIface) GetBind() device.EndpointManager {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.tun == nil {
+		return nil
+	}
+	return w.tun.GetICEBind()
+}
+
 // IsUserspaceBind indicates whether this interfaces is userspace with bind.ICEBind
 func (w *WGIface) IsUserspaceBind() bool {
 	return w.userspaceBind
@@ -68,8 +102,12 @@ func (w *WGIface) Name() string {
 }
 
 // Address returns the interface address
-func (w *WGIface) Address() device.WGAddress {
+func (w *WGIface) Address() wgaddr.Address {
 	return w.tun.WgAddress()
+}
+
+func (w *WGIface) MTU() uint16 {
+	return w.tun.MTU()
 }
 
 // ToInterface returns the net.Interface for the Wireguard interface
@@ -87,7 +125,7 @@ func (r *WGIface) ToInterface() *net.Interface {
 
 // Up configures a Wireguard interface
 // The interface must exist before calling this method (e.g. call interface.Create() before)
-func (w *WGIface) Up() (*bind.UniversalUDPMuxDefault, error) {
+func (w *WGIface) Up() (*udpmux.UniversalUDPMuxDefault, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -99,7 +137,7 @@ func (w *WGIface) UpdateAddr(newAddr string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	addr, err := device.ParseWGAddress(newAddr)
+	addr, err := wgaddr.ParseWGAddress(newAddr)
 	if err != nil {
 		return err
 	}
@@ -108,37 +146,61 @@ func (w *WGIface) UpdateAddr(newAddr string) error {
 }
 
 // UpdatePeer updates existing Wireguard Peer or creates a new one if doesn't exist
-// Endpoint is optional
-func (w *WGIface) UpdatePeer(peerKey string, allowedIps string, keepAlive time.Duration, endpoint *net.UDPAddr, preSharedKey *wgtypes.Key) error {
+// Endpoint is optional.
+// If allowedIps is given it will be added to the existing ones.
+func (w *WGIface) UpdatePeer(peerKey string, allowedIps []netip.Prefix, keepAlive time.Duration, endpoint *net.UDPAddr, preSharedKey *wgtypes.Key) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.configurer == nil {
+		return ErrIfaceNotFound
+	}
 
-	log.Debugf("updating interface %s peer %s, endpoint %s", w.tun.DeviceName(), peerKey, endpoint)
+	log.Debugf("updating interface %s peer %s, endpoint %s, allowedIPs %v", w.tun.DeviceName(), peerKey, endpoint, allowedIps)
 	return w.configurer.UpdatePeer(peerKey, allowedIps, keepAlive, endpoint, preSharedKey)
+}
+
+func (w *WGIface) RemoveEndpointAddress(peerKey string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.configurer == nil {
+		return ErrIfaceNotFound
+	}
+
+	log.Debugf("Removing endpoint address: %s", peerKey)
+	return w.configurer.RemoveEndpointAddress(peerKey)
 }
 
 // RemovePeer removes a Wireguard Peer from the interface iface
 func (w *WGIface) RemovePeer(peerKey string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.configurer == nil {
+		return ErrIfaceNotFound
+	}
 
 	log.Debugf("Removing peer %s from interface %s ", peerKey, w.tun.DeviceName())
 	return w.configurer.RemovePeer(peerKey)
 }
 
 // AddAllowedIP adds a prefix to the allowed IPs list of peer
-func (w *WGIface) AddAllowedIP(peerKey string, allowedIP string) error {
+func (w *WGIface) AddAllowedIP(peerKey string, allowedIP netip.Prefix) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.configurer == nil {
+		return ErrIfaceNotFound
+	}
 
 	log.Debugf("Adding allowed IP to interface %s and peer %s: allowed IP %s ", w.tun.DeviceName(), peerKey, allowedIP)
 	return w.configurer.AddAllowedIP(peerKey, allowedIP)
 }
 
 // RemoveAllowedIP removes a prefix from the allowed IPs list of peer
-func (w *WGIface) RemoveAllowedIP(peerKey string, allowedIP string) error {
+func (w *WGIface) RemoveAllowedIP(peerKey string, allowedIP netip.Prefix) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.configurer == nil {
+		return ErrIfaceNotFound
+	}
 
 	log.Debugf("Removing allowed IP from interface %s and peer %s: allowed IP %s ", w.tun.DeviceName(), peerKey, allowedIP)
 	return w.configurer.RemoveAllowedIP(peerKey, allowedIP)
@@ -181,7 +243,6 @@ func (w *WGIface) SetFilter(filter device.PacketFilter) error {
 	}
 
 	w.filter = filter
-	w.filter.SetNetwork(w.tun.WgAddress().Network)
 
 	w.tun.FilteredDevice().SetFilter(filter)
 	return nil
@@ -203,9 +264,37 @@ func (w *WGIface) GetDevice() *device.FilteredDevice {
 	return w.tun.FilteredDevice()
 }
 
-// GetStats returns the last handshake time, rx and tx bytes for the given peer
-func (w *WGIface) GetStats(peerKey string) (configurer.WGStats, error) {
-	return w.configurer.GetStats(peerKey)
+// GetWGDevice returns the WireGuard device
+func (w *WGIface) GetWGDevice() *wgdevice.Device {
+	return w.tun.Device()
+}
+
+// GetStats returns the last handshake time, rx and tx bytes
+func (w *WGIface) GetStats() (map[string]configurer.WGStats, error) {
+	if w.configurer == nil {
+		return nil, ErrIfaceNotFound
+	}
+	return w.configurer.GetStats()
+}
+
+func (w *WGIface) LastActivities() map[string]monotime.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.configurer == nil {
+		return nil
+	}
+
+	return w.configurer.LastActivities()
+
+}
+
+func (w *WGIface) FullStats() (*configurer.Stats, error) {
+	if w.configurer == nil {
+		return nil, ErrIfaceNotFound
+	}
+
+	return w.configurer.FullStats()
 }
 
 func (w *WGIface) waitUntilRemoved() error {
@@ -233,4 +322,12 @@ func (w *WGIface) waitUntilRemoved() error {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
+}
+
+// GetNet returns the netstack.Net for the netstack device
+func (w *WGIface) GetNet() *netstack.Net {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.tun.GetNet()
 }

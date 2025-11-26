@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -22,31 +23,34 @@ import (
 	"github.com/netbirdio/netbird/client/internal/dns"
 	"github.com/netbirdio/netbird/client/internal/listener"
 	"github.com/netbirdio/netbird/client/internal/peer"
+	"github.com/netbirdio/netbird/client/internal/profilemanager"
 	"github.com/netbirdio/netbird/client/internal/stdnet"
+	nbnet "github.com/netbirdio/netbird/client/net"
+	cProto "github.com/netbirdio/netbird/client/proto"
 	"github.com/netbirdio/netbird/client/ssh"
 	"github.com/netbirdio/netbird/client/system"
-	mgm "github.com/netbirdio/netbird/management/client"
-	mgmProto "github.com/netbirdio/netbird/management/proto"
-	"github.com/netbirdio/netbird/relay/auth/hmac"
-	relayClient "github.com/netbirdio/netbird/relay/client"
-	signal "github.com/netbirdio/netbird/signal/client"
+	mgm "github.com/netbirdio/netbird/shared/management/client"
+	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
+	"github.com/netbirdio/netbird/shared/relay/auth/hmac"
+	relayClient "github.com/netbirdio/netbird/shared/relay/client"
+	signal "github.com/netbirdio/netbird/shared/signal/client"
 	"github.com/netbirdio/netbird/util"
 	"github.com/netbirdio/netbird/version"
 )
 
 type ConnectClient struct {
 	ctx            context.Context
-	config         *Config
+	config         *profilemanager.Config
 	statusRecorder *peer.Status
 	engine         *Engine
 	engineMutex    sync.Mutex
 
-	persistNetworkMap bool
+	persistSyncResponse bool
 }
 
 func NewConnectClient(
 	ctx context.Context,
-	config *Config,
+	config *profilemanager.Config,
 	statusRecorder *peer.Status,
 
 ) *ConnectClient {
@@ -59,13 +63,8 @@ func NewConnectClient(
 }
 
 // Run with main logic.
-func (c *ConnectClient) Run() error {
-	return c.run(MobileDependency{}, nil, nil)
-}
-
-// RunWithProbes runs the client's main logic with probes attached
-func (c *ConnectClient) RunWithProbes(probes *ProbeHolder, runningChan chan error) error {
-	return c.run(MobileDependency{}, probes, runningChan)
+func (c *ConnectClient) Run(runningChan chan struct{}) error {
+	return c.run(MobileDependency{}, runningChan)
 }
 
 // RunOnAndroid with main logic on mobile system
@@ -73,8 +72,9 @@ func (c *ConnectClient) RunOnAndroid(
 	tunAdapter device.TunAdapter,
 	iFaceDiscover stdnet.ExternalIFaceDiscover,
 	networkChangeListener listener.NetworkChangeListener,
-	dnsAddresses []string,
+	dnsAddresses []netip.AddrPort,
 	dnsReadyListener dns.ReadyListener,
+	stateFilePath string,
 ) error {
 	// in case of non Android os these variables will be nil
 	mobileDependency := MobileDependency{
@@ -83,8 +83,9 @@ func (c *ConnectClient) RunOnAndroid(
 		NetworkChangeListener: networkChangeListener,
 		HostDNSAddresses:      dnsAddresses,
 		DnsReadyListener:      dnsReadyListener,
+		StateFilePath:         stateFilePath,
 	}
-	return c.run(mobileDependency, nil, nil)
+	return c.run(mobileDependency, nil)
 }
 
 func (c *ConnectClient) RunOniOS(
@@ -102,17 +103,29 @@ func (c *ConnectClient) RunOniOS(
 		DnsManager:            dnsManager,
 		StateFilePath:         stateFilePath,
 	}
-	return c.run(mobileDependency, nil, nil)
+	return c.run(mobileDependency, nil)
 }
 
-func (c *ConnectClient) run(mobileDependency MobileDependency, probes *ProbeHolder, runningChan chan error) error {
+func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan struct{}) error {
 	defer func() {
 		if r := recover(); r != nil {
+			rec := c.statusRecorder
+			if rec != nil {
+				rec.PublishEvent(
+					cProto.SystemEvent_CRITICAL, cProto.SystemEvent_SYSTEM,
+					"panic occurred",
+					"The Netbird service panicked. Please restart the service and submit a bug report with the client logs.",
+					nil,
+				)
+			}
+
 			log.Panicf("Panic occurred: %v, stack trace: %s", r, string(debug.Stack()))
 		}
 	}()
 
 	log.Infof("starting NetBird client version %s on %s/%s", version.NetbirdVersion(), runtime.GOOS, runtime.GOARCH)
+
+	nbnet.Init()
 
 	backOff := &backoff.ExponentialBackOff{
 		InitialInterval:     time.Second,
@@ -150,10 +163,9 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, probes *ProbeHold
 	}
 
 	defer c.statusRecorder.ClientStop()
-	runningChanOpen := true
 	operation := func() error {
 		// if context cancelled we not start new backoff cycle
-		if c.isContextCancelled() {
+		if c.ctx.Err() != nil {
 			return nil
 		}
 
@@ -182,8 +194,8 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, probes *ProbeHold
 			}
 		}()
 
-		// connect (just a connection, no stream yet) and login to Management Service to get an initial global Wiretrustee config
-		loginResp, err := loginToManagement(engineCtx, mgmClient, publicSSHKey)
+		// connect (just a connection, no stream yet) and login to Management Service to get an initial global Netbird config
+		loginResp, err := loginToManagement(engineCtx, mgmClient, publicSSHKey, c.config)
 		if err != nil {
 			log.Debug(err)
 			if s, ok := gstatus.FromError(err); ok && (s.Code() == codes.PermissionDenied) {
@@ -204,8 +216,8 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, probes *ProbeHold
 		c.statusRecorder.UpdateLocalPeerState(localPeerState)
 
 		signalURL := fmt.Sprintf("%s://%s",
-			strings.ToLower(loginResp.GetWiretrusteeConfig().GetSignal().GetProtocol().String()),
-			loginResp.GetWiretrusteeConfig().GetSignal().GetUri(),
+			strings.ToLower(loginResp.GetNetbirdConfig().GetSignal().GetProtocol().String()),
+			loginResp.GetNetbirdConfig().GetSignal().GetUri(),
 		)
 
 		c.statusRecorder.UpdateSignalAddress(signalURL)
@@ -216,8 +228,8 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, probes *ProbeHold
 			c.statusRecorder.MarkSignalDisconnected(err)
 		}()
 
-		// with the global Wiretrustee config in hand connect (just a connection, no stream yet) Signal
-		signalClient, err := connectToSignal(engineCtx, loginResp.GetWiretrusteeConfig(), myPrivateKey)
+		// with the global Netbird config in hand connect (just a connection, no stream yet) Signal
+		signalClient, err := connectToSignal(engineCtx, loginResp.GetNetbirdConfig(), myPrivateKey)
 		if err != nil {
 			log.Error(err)
 			return wrapErr(err)
@@ -235,7 +247,15 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, probes *ProbeHold
 		c.statusRecorder.MarkSignalConnected()
 
 		relayURLs, token := parseRelayInfo(loginResp)
-		relayManager := relayClient.NewManager(engineCtx, relayURLs, myPrivateKey.PublicKey().String())
+		peerConfig := loginResp.GetPeerConfig()
+
+		engineConfig, err := createEngineConfig(myPrivateKey, c.config, peerConfig)
+		if err != nil {
+			log.Error(err)
+			return wrapErr(err)
+		}
+
+		relayManager := relayClient.NewManager(engineCtx, relayURLs, myPrivateKey.PublicKey().String(), engineConfig.MTU)
 		c.statusRecorder.SetRelayMgr(relayManager)
 		if len(relayURLs) > 0 {
 			if token != nil {
@@ -250,22 +270,14 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, probes *ProbeHold
 			}
 		}
 
-		peerConfig := loginResp.GetPeerConfig()
-
-		engineConfig, err := createEngineConfig(myPrivateKey, c.config, peerConfig)
-		if err != nil {
-			log.Error(err)
-			return wrapErr(err)
-		}
-
 		checks := loginResp.GetChecks()
 
 		c.engineMutex.Lock()
-		c.engine = NewEngineWithProbes(engineCtx, cancel, signalClient, mgmClient, relayManager, engineConfig, mobileDependency, c.statusRecorder, probes, checks)
-		c.engine.SetNetworkMapPersistence(c.persistNetworkMap)
+		c.engine = NewEngine(engineCtx, cancel, signalClient, mgmClient, relayManager, engineConfig, mobileDependency, c.statusRecorder, checks)
+		c.engine.SetSyncResponsePersistence(c.persistSyncResponse)
 		c.engineMutex.Unlock()
 
-		if err := c.engine.Start(); err != nil {
+		if err := c.engine.Start(loginResp.GetNetbirdConfig(), c.config.ManagementURL); err != nil {
 			log.Errorf("error while starting Netbird Connection Engine: %s", err)
 			return wrapErr(err)
 		}
@@ -273,22 +285,24 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, probes *ProbeHold
 		log.Infof("Netbird engine started, the IP is: %s", peerConfig.GetAddress())
 		state.Set(StatusConnected)
 
-		if runningChan != nil && runningChanOpen {
-			runningChan <- nil
+		if runningChan != nil {
 			close(runningChan)
-			runningChanOpen = false
+			runningChan = nil
 		}
 
 		<-engineCtx.Done()
+
 		c.engineMutex.Lock()
-		if c.engine != nil && c.engine.wgInterface != nil {
-			log.Infof("ensuring %s is removed, Netbird engine context cancelled", c.engine.wgInterface.Name())
-			if err := c.engine.Stop(); err != nil {
+		engine := c.engine
+		c.engine = nil
+		c.engineMutex.Unlock()
+
+		if engine != nil && engine.wgInterface != nil {
+			log.Infof("ensuring %s is removed, Netbird engine context cancelled", engine.wgInterface.Name())
+			if err := engine.Stop(); err != nil {
 				log.Errorf("Failed to stop engine: %v", err)
 			}
-			c.engine = nil
 		}
-		c.engineMutex.Unlock()
 		c.statusRecorder.ClientTeardown()
 
 		backOff.Reset()
@@ -316,7 +330,7 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, probes *ProbeHold
 }
 
 func parseRelayInfo(loginResp *mgmProto.LoginResponse) ([]string, *hmac.Token) {
-	relayCfg := loginResp.GetWiretrusteeConfig().GetRelay()
+	relayCfg := loginResp.GetNetbirdConfig().GetRelay()
 	if relayCfg == nil {
 		return nil, nil
 	}
@@ -340,6 +354,25 @@ func (c *ConnectClient) Engine() *Engine {
 	return e
 }
 
+// GetLatestSyncResponse returns the latest sync response from the engine.
+func (c *ConnectClient) GetLatestSyncResponse() (*mgmProto.SyncResponse, error) {
+	engine := c.Engine()
+	if engine == nil {
+		return nil, errors.New("engine is not initialized")
+	}
+
+	syncResponse, err := engine.GetLatestSyncResponse()
+	if err != nil {
+		return nil, fmt.Errorf("get latest sync response: %w", err)
+	}
+
+	if syncResponse == nil {
+		return nil, errors.New("sync response is not available")
+	}
+
+	return syncResponse, nil
+}
+
 // Status returns the current client status
 func (c *ConnectClient) Status() StatusType {
 	if c == nil {
@@ -354,72 +387,67 @@ func (c *ConnectClient) Status() StatusType {
 }
 
 func (c *ConnectClient) Stop() error {
-	if c == nil {
-		return nil
+	engine := c.Engine()
+	if engine != nil {
+		if err := engine.Stop(); err != nil {
+			return fmt.Errorf("stop engine: %w", err)
+		}
 	}
-	c.engineMutex.Lock()
-	defer c.engineMutex.Unlock()
-
-	if c.engine == nil {
-		return nil
-	}
-	if err := c.engine.Stop(); err != nil {
-		return fmt.Errorf("stop engine: %w", err)
-	}
-
 	return nil
 }
 
-func (c *ConnectClient) isContextCancelled() bool {
-	select {
-	case <-c.ctx.Done():
-		return true
-	default:
-		return false
-	}
-}
-
-// SetNetworkMapPersistence enables or disables network map persistence.
-// When enabled, the last received network map will be stored and can be retrieved
-// through the Engine's getLatestNetworkMap method. When disabled, any stored
-// network map will be cleared.
-func (c *ConnectClient) SetNetworkMapPersistence(enabled bool) {
+// SetSyncResponsePersistence enables or disables sync response persistence.
+// When enabled, the last received sync response will be stored and can be retrieved
+// through the Engine's GetLatestSyncResponse method. When disabled, any stored
+// sync response will be cleared.
+func (c *ConnectClient) SetSyncResponsePersistence(enabled bool) {
 	c.engineMutex.Lock()
-	c.persistNetworkMap = enabled
+	c.persistSyncResponse = enabled
 	c.engineMutex.Unlock()
 
 	engine := c.Engine()
 	if engine != nil {
-		engine.SetNetworkMapPersistence(enabled)
+		engine.SetSyncResponsePersistence(enabled)
 	}
 }
 
 // createEngineConfig converts configuration received from Management Service to EngineConfig
-func createEngineConfig(key wgtypes.Key, config *Config, peerConfig *mgmProto.PeerConfig) (*EngineConfig, error) {
+func createEngineConfig(key wgtypes.Key, config *profilemanager.Config, peerConfig *mgmProto.PeerConfig) (*EngineConfig, error) {
 	nm := false
 	if config.NetworkMonitor != nil {
 		nm = *config.NetworkMonitor
 	}
 	engineConf := &EngineConfig{
-		WgIfaceName:          config.WgIface,
-		WgAddr:               peerConfig.Address,
-		IFaceBlackList:       config.IFaceBlackList,
-		DisableIPv6Discovery: config.DisableIPv6Discovery,
-		WgPrivateKey:         key,
-		WgPort:               config.WgPort,
-		NetworkMonitor:       nm,
-		SSHKey:               []byte(config.SSHKey),
-		NATExternalIPs:       config.NATExternalIPs,
-		CustomDNSAddress:     config.CustomDNSAddress,
-		RosenpassEnabled:     config.RosenpassEnabled,
-		RosenpassPermissive:  config.RosenpassPermissive,
-		ServerSSHAllowed:     util.ReturnBoolWithDefaultTrue(config.ServerSSHAllowed),
-		DNSRouteInterval:     config.DNSRouteInterval,
+		WgIfaceName:                   config.WgIface,
+		WgAddr:                        peerConfig.Address,
+		IFaceBlackList:                config.IFaceBlackList,
+		DisableIPv6Discovery:          config.DisableIPv6Discovery,
+		WgPrivateKey:                  key,
+		WgPort:                        config.WgPort,
+		NetworkMonitor:                nm,
+		SSHKey:                        []byte(config.SSHKey),
+		NATExternalIPs:                config.NATExternalIPs,
+		CustomDNSAddress:              config.CustomDNSAddress,
+		RosenpassEnabled:              config.RosenpassEnabled,
+		RosenpassPermissive:           config.RosenpassPermissive,
+		ServerSSHAllowed:              util.ReturnBoolWithDefaultTrue(config.ServerSSHAllowed),
+		EnableSSHRoot:                 config.EnableSSHRoot,
+		EnableSSHSFTP:                 config.EnableSSHSFTP,
+		EnableSSHLocalPortForwarding:  config.EnableSSHLocalPortForwarding,
+		EnableSSHRemotePortForwarding: config.EnableSSHRemotePortForwarding,
+		DisableSSHAuth:                config.DisableSSHAuth,
+		DNSRouteInterval:              config.DNSRouteInterval,
 
 		DisableClientRoutes: config.DisableClientRoutes,
-		DisableServerRoutes: config.DisableServerRoutes,
+		DisableServerRoutes: config.DisableServerRoutes || config.BlockInbound,
 		DisableDNS:          config.DisableDNS,
 		DisableFirewall:     config.DisableFirewall,
+		BlockLANAccess:      config.BlockLANAccess,
+		BlockInbound:        config.BlockInbound,
+
+		LazyConnectionEnabled: config.LazyConnectionEnabled,
+
+		MTU: selectMTU(config.MTU, peerConfig.Mtu),
 	}
 
 	if config.PreSharedKey != "" {
@@ -442,8 +470,22 @@ func createEngineConfig(key wgtypes.Key, config *Config, peerConfig *mgmProto.Pe
 	return engineConf, nil
 }
 
+func selectMTU(localMTU uint16, peerMTU int32) uint16 {
+	var finalMTU uint16 = iface.DefaultMTU
+	if localMTU > 0 {
+		finalMTU = localMTU
+	} else if peerMTU > 0 {
+		finalMTU = uint16(peerMTU)
+	}
+
+	// Set global DNS MTU
+	dns.SetCurrentMTU(finalMTU)
+
+	return finalMTU
+}
+
 // connectToSignal creates Signal Service client and established a connection
-func connectToSignal(ctx context.Context, wtConfig *mgmProto.WiretrusteeConfig, ourPrivateKey wgtypes.Key) (*signal.GrpcClient, error) {
+func connectToSignal(ctx context.Context, wtConfig *mgmProto.NetbirdConfig, ourPrivateKey wgtypes.Key) (*signal.GrpcClient, error) {
 	var sigTLSEnabled bool
 	if wtConfig.Signal.Protocol == mgmProto.HostConfig_HTTPS {
 		sigTLSEnabled = true
@@ -460,8 +502,8 @@ func connectToSignal(ctx context.Context, wtConfig *mgmProto.WiretrusteeConfig, 
 	return signalClient, nil
 }
 
-// loginToManagement creates Management Services client, establishes a connection, logs-in and gets a global Wiretrustee config (signal, turn, stun hosts, etc)
-func loginToManagement(ctx context.Context, client mgm.Client, pubSSHKey []byte) (*mgmProto.LoginResponse, error) {
+// loginToManagement creates Management ServiceDependencies client, establishes a connection, logs-in and gets a global Netbird config (signal, turn, stun hosts, etc)
+func loginToManagement(ctx context.Context, client mgm.Client, pubSSHKey []byte, config *profilemanager.Config) (*mgmProto.LoginResponse, error) {
 
 	serverPublicKey, err := client.GetServerPublicKey()
 	if err != nil {
@@ -469,7 +511,24 @@ func loginToManagement(ctx context.Context, client mgm.Client, pubSSHKey []byte)
 	}
 
 	sysInfo := system.GetInfo(ctx)
-	loginResp, err := client.Login(*serverPublicKey, sysInfo, pubSSHKey)
+	sysInfo.SetFlags(
+		config.RosenpassEnabled,
+		config.RosenpassPermissive,
+		config.ServerSSHAllowed,
+		config.DisableClientRoutes,
+		config.DisableServerRoutes,
+		config.DisableDNS,
+		config.DisableFirewall,
+		config.BlockLANAccess,
+		config.BlockInbound,
+		config.LazyConnectionEnabled,
+		config.EnableSSHRoot,
+		config.EnableSSHSFTP,
+		config.EnableSSHLocalPortForwarding,
+		config.EnableSSHRemotePortForwarding,
+		config.DisableSSHAuth,
+	)
+	loginResp, err := client.Login(*serverPublicKey, sysInfo, pubSSHKey, config.DNSLabels)
 	if err != nil {
 		return nil, err
 	}
@@ -491,17 +550,13 @@ func statusRecorderToSignalConnStateNotifier(statusRecorder *peer.Status) signal
 
 // freePort attempts to determine if the provided port is available, if not it will ask the system for a free port.
 func freePort(initPort int) (int, error) {
-	addr := net.UDPAddr{}
-	if initPort == 0 {
-		initPort = iface.DefaultWgPort
-	}
-
-	addr.Port = initPort
+	addr := net.UDPAddr{Port: initPort}
 
 	conn, err := net.ListenUDP("udp", &addr)
 	if err == nil {
+		returnPort := conn.LocalAddr().(*net.UDPAddr).Port
 		closeConnWithLog(conn)
-		return initPort, nil
+		return returnPort, nil
 	}
 
 	// if the port is already in use, ask the system for a free port
